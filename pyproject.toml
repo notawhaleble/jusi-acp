@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jusi-acp"
+version = "0.1.0"
+description = "ACP plugin family and shared interactive client for Jusi 1.0"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "notawhaleble" }]
+keywords = ["acp", "jusi", "jupyter", "agent", "visidata"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: Jupyter",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "agent-client-protocol>=0.12.1,<0.13",
+  "jusi[vd]>=1.0.2,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/notawhaleble/jusi-acp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jusi_acp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

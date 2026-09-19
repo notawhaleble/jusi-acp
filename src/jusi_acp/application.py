@@ -9,6 +9,7 @@ from pathlib import Path
 import shlex
 import sys
 import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -32,6 +33,7 @@ from .ui import (
     make_diffs_sheet,
     make_events_sheet,
     make_permission_sheet,
+    make_turns_sheet,
     queue_action,
 )
 
@@ -69,6 +71,8 @@ class ACPApplication:
 
         self.store = EventStore(self.plugin_id, self.cwd)
         self.sheet: Any = None
+        self.turns_sheet: Any = None
+        self.live_sheet: Any = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.connection: Any = None
         self.initialize_response: Any = None
@@ -85,6 +89,11 @@ class ACPApplication:
         self._operation_cancel: threading.Event | None = None
         self._permission_lock = threading.Lock()
         self._permissions: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]] = {}
+        self._refresh_lock = threading.Lock()
+        self._refresh_scheduled = False
+        self._refresh_dirty = False
+        self._refresh_follow_tail = False
+        self._last_refresh = 0.0
         roots = (self.cwd, *self.additional_directories)
         self.terminals = TerminalManager(roots, observer=self._terminal_changed)
         self._thread: threading.Thread | None = None
@@ -105,7 +114,7 @@ class ACPApplication:
         elif kind == "config_option_update":
             self.config_options = list(getattr(update, "config_options", []))
         self.store.add(update)
-        self._refresh()
+        self._refresh(follow_tail=True)
 
     async def request_permission(
         self, session_id: str, tool_call: Any, options: list[Any], **kwargs: Any
@@ -186,12 +195,17 @@ class ACPApplication:
         except BaseException as exc:
             self._failed = exc
             self.store.add_status("ACP runtime failed", f"{type(exc).__name__}: {exc}", "failed")
+            if self.store.active_turn is not None:
+                self.store.add({"kind": "turn_stopped", "stopReason": "failed"}, source="client")
             self._refresh()
+            queue_action(self._focus_turns_sheet)
+            queue_action(lambda exc=exc: _raise_exception(exc))
         finally:
             self._connected.set()
 
     async def _async_main(self) -> None:
         self.loop = asyncio.get_running_loop()
+        self.loop.set_exception_handler(self._handle_asyncio_exception)
         self._prompt_lock = asyncio.Lock()
         self._shutdown = asyncio.Event()
         capabilities = ClientCapabilities(
@@ -342,12 +356,18 @@ class ACPApplication:
                 self._operation_cancel = None
 
     def _submit(self, coroutine: Any) -> dict[str, Any]:
-        if not self._connected.wait(10):
-            raise RuntimeError("ACP agent did not become ready")
-        if self._failed is not None:
-            raise RuntimeError(f"ACP runtime failed: {self._failed}")
-        if self.loop is None:
-            raise RuntimeError("ACP runtime loop is unavailable")
+        try:
+            if not self._connected.wait(10):
+                raise RuntimeError("ACP agent did not become ready")
+            if self._failed is not None:
+                raise RuntimeError(f"ACP runtime failed: {self._failed}")
+            if self.loop is None or self.loop.is_closed():
+                raise RuntimeError("ACP runtime loop is unavailable")
+        except BaseException:
+            close = getattr(coroutine, "close", None)
+            if close is not None:
+                close()
+            raise
         future: ConcurrentFuture[dict[str, Any]] = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
         return future.result()
 
@@ -398,13 +418,30 @@ class ACPApplication:
             if not initial and operation_cancel is not None and operation_cancel.is_set():
                 raise InterruptedError("ACP turn cancelled")
             self.store.add({"kind": "user_prompt", "text": body}, source="user")
-            self._refresh()
-            response = await self.connection.prompt(
-                self.session_id, [TextContentBlock(type="text", text=body)]
-            )
+            turn = self.store.active_turn
+            if turn is not None:
+                turn_number = int(turn["turn"])
+                queue_action(lambda: self._show_live_turn(turn_number))
+            self._refresh(follow_tail=True)
+            try:
+                response = await self.connection.prompt(
+                    self.session_id, [TextContentBlock(type="text", text=body)]
+                )
+            except Exception as exc:
+                self.store.add({
+                    "kind": "turn_error",
+                    "title": "Turn failed",
+                    "text": f"{type(exc).__name__}: {exc}",
+                    "status": "failed",
+                }, source="client")
+                self.store.add({"kind": "turn_stopped", "stopReason": "failed"}, source="client")
+                self._refresh()
+                queue_action(self._focus_turns_sheet)
+                raise
             stop_reason = str(response.stop_reason)
             self.store.add({"kind": "turn_stopped", "stopReason": stop_reason}, source="agent")
             self._refresh()
+            queue_action(self._focus_turns_sheet)
             cancelled = (
                 self._cancel_requested.is_set()
                 if initial
@@ -432,7 +469,7 @@ class ACPApplication:
                 self._operation_cancel.set()
         self._cancel_permissions()
         loop = self.loop
-        if loop is not None:
+        if loop is not None and not loop.is_closed():
             loop.call_soon_threadsafe(lambda: asyncio.create_task(self._cancel()))
 
     async def _cancel(self) -> None:
@@ -443,7 +480,7 @@ class ACPApplication:
         self._cancel_permissions()
         loop = self.loop
         shutdown = self._shutdown
-        if loop is not None and shutdown is not None:
+        if loop is not None and not loop.is_closed() and shutdown is not None:
             loop.call_soon_threadsafe(shutdown.set)
         if self._thread is not None:
             self._thread.join(timeout=4)
@@ -495,18 +532,96 @@ class ACPApplication:
         if status is not None:
             label = f"exit {status.exit_code}" if status.exit_code is not None else f"signal {status.signal}"
         self.store.update_terminal(terminal_id, output, truncated, label or "running")
-        self._refresh()
+        self._refresh(follow_tail=True)
 
-    def _refresh(self) -> None:
-        if self.sheet is None:
+    def _refresh(self, *, follow_tail: bool = False) -> None:
+        with self._refresh_lock:
+            self._refresh_dirty = True
+            self._refresh_follow_tail = self._refresh_follow_tail or follow_tail
+            if self._refresh_scheduled:
+                return
+            self._refresh_scheduled = True
+            delay = max(0.0, 0.1 - (time.monotonic() - self._last_refresh))
+        if delay:
+            timer = threading.Timer(delay, self._queue_refresh)
+            timer.daemon = True
+            timer.start()
+        else:
+            self._queue_refresh()
+
+    def _queue_refresh(self) -> None:
+        queue_action(self._flush_refresh)
+
+    def _flush_refresh(self) -> None:
+        with self._refresh_lock:
+            follow_tail = self._refresh_follow_tail
+            self._refresh_follow_tail = False
+            self._refresh_dirty = False
+            self._refresh_scheduled = False
+            self._last_refresh = time.monotonic()
+        if self.turns_sheet is not None:
+            self.turns_sheet.rows = self.store.turns_snapshot()
+            self.turns_sheet.recalc()
+        if self.live_sheet is not None:
+            should_follow_tail = follow_tail and self._live_sheet_should_follow_tail()
+            turn_number = getattr(self.live_sheet, "jusi_acp_turn", None)
+            if turn_number is not None:
+                self.live_sheet.rows = self.store.turn_events_snapshot(int(turn_number))
+            elif getattr(self.live_sheet, "jusi_acp_raw", False):
+                self.live_sheet.rows = self.store.raw_snapshot()
+            self.live_sheet.recalc()
+            if should_follow_tail:
+                self.live_sheet.cursorRowIndex = max(0, len(self.live_sheet.rows) - 1)
+        with self._refresh_lock:
+            dirty = self._refresh_dirty
+        if dirty:
+            self._refresh()
+
+    def _live_sheet_should_follow_tail(self) -> bool:
+        sheet = self.live_sheet
+        if sheet is None:
+            return True
+        rows = getattr(sheet, "rows", [])
+        if not rows:
+            return True
+        try:
+            return int(sheet.cursorRowIndex) >= len(rows) - 1
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _show_live_turn(self, turn_number: int) -> None:
+        from visidata import vd
+        self.live_sheet = make_events_sheet(
+            self,
+            self.store.turn_events_snapshot(turn_number),
+            name=f"acp:{self.alias}:turn-{turn_number}",
+        )
+        self.live_sheet.jusi_acp_turn = turn_number
+        self.sheet = self.live_sheet
+        vd.push(self.live_sheet)
+
+    def _focus_turns_sheet(self) -> None:
+        if self.turns_sheet is None:
             return
-        def refresh() -> None:
-            try:
-                self.sheet.rows = self.store.rows
-                self.sheet.recalc()
-            except Exception:
-                pass
-        queue_action(refresh)
+        from visidata import vd
+        self.turns_sheet.rows = self.store.turns_snapshot()
+        self.turns_sheet.recalc()
+        vd.push(self.turns_sheet)
+
+    def _handle_asyncio_exception(
+        self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+    ) -> None:
+        _ = loop
+        error = context.get("exception")
+        if not isinstance(error, BaseException):
+            error = RuntimeError(str(context.get("message", "ACP background task failed")))
+        self.store.add_status(
+            "ACP background task failed",
+            f"{type(error).__name__}: {error}",
+            "failed",
+        )
+        self._refresh()
+        queue_action(lambda error=error: _raise_exception(error))
 
     def open_event(self, row: dict[str, Any]) -> None:
         diffs = row.get("diffs", [])
@@ -537,6 +652,10 @@ class ACPApplication:
 def _resolve_future(future: asyncio.Future[Any], value: Any) -> None:
     if not future.done():
         future.set_result(value)
+
+
+def _raise_exception(exc: BaseException) -> None:
+    raise exc.with_traceback(exc.__traceback__)
 
 
 def _available_command_detail(command: Any) -> str:
@@ -570,10 +689,13 @@ def run_application(payload_path: Path, socket_path: str) -> int:
     vd = initialize_visidata(open_name="acp.txt", open_filetype="text")
     install_api()
     vd._jusi_acp_runtime = runtime
-    runtime.sheet = make_events_sheet(runtime)
-    runtime.start()
+    runtime.turns_sheet = make_turns_sheet(runtime)
+    runtime.live_sheet = make_events_sheet(runtime, [], name=f"acp:{runtime.alias}:session")
+    runtime.live_sheet.jusi_acp_raw = True
+    runtime.sheet = runtime.live_sheet
+    vd.queueCommand("jusi-acp-start-runtime", sheet=runtime.live_sheet)
     try:
-        vd.run(runtime.sheet)
+        vd.run(runtime.turns_sheet, runtime.live_sheet)
     finally:
         runtime.close()
     return 0

@@ -1,6 +1,7 @@
 """Normalized, read-only presentation cache for ACP sessions."""
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -29,7 +30,9 @@ class EventStore:
     cwd: Path
     session_id: str = ""
     rows: list[dict[str, Any]] = field(default_factory=list)
+    turns: list[dict[str, Any]] = field(default_factory=list)
     _lock: Lock = field(default_factory=Lock, repr=False)
+    _active_turn: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def bind_session(self, session_id: str, *, load_cache: bool) -> None:
         self.session_id = session_id
@@ -50,6 +53,10 @@ class EventStore:
             return
         with self._lock:
             self.rows[:] = cached
+            self.turns.clear()
+            self._active_turn = None
+            for row in cached:
+                self._project(row)
 
     def add(self, update: Any, *, source: str = "agent") -> dict[str, Any]:
         raw = _json_value(update)
@@ -69,6 +76,7 @@ class EventStore:
         }
         with self._lock:
             self.rows.append(row)
+            self._project(row)
         self._append(row)
         return row
 
@@ -76,27 +84,89 @@ class EventStore:
         return self.add({"kind": "status", "title": title, "text": text, "status": status}, source="client")
 
     def update_terminal(self, terminal_id: str, output: str, truncated: bool, status: str = "") -> None:
+        row = {
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "source": "client",
+            "type": "terminal",
+            "title": f"Terminal {terminal_id}" + (" (truncated)" if truncated else ""),
+            "status": status,
+            "text": output,
+            "tool_call_id": "",
+            "terminal_id": terminal_id,
+            "diffs": [],
+            "raw": {
+                "kind": "terminal",
+                "terminalId": terminal_id,
+                "output": output,
+                "truncated": truncated,
+                "status": status,
+            },
+            "cached": False,
+        }
         with self._lock:
-            existing = next((row for row in reversed(self.rows) if row.get("terminal_id") == terminal_id), None)
+            existing = next(
+                (item for item in reversed(self.rows) if item.get("terminal_id") == terminal_id),
+                None,
+            )
             if existing is None:
-                existing = {
-                    "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "source": "client",
-                    "type": "terminal",
-                    "title": f"Terminal {terminal_id}",
-                    "status": status,
-                    "text": output,
-                    "tool_call_id": "",
-                    "terminal_id": terminal_id,
-                    "diffs": [],
-                    "raw": {},
-                    "cached": False,
-                }
-                self.rows.append(existing)
+                self.rows.append(row)
             else:
-                existing["text"] = output
-                existing["status"] = status
-                existing["title"] = f"Terminal {terminal_id}" + (" (truncated)" if truncated else "")
+                existing.update(row)
+            self._project(row)
+        if status != "running":
+            self._append(row)
+
+    @property
+    def active_turn(self) -> dict[str, Any] | None:
+        with self._lock:
+            return self._active_turn
+
+    def raw_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return deepcopy(self.rows)
+
+    def turns_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [deepcopy({key: value for key, value in turn.items() if key != "events"})
+                    for turn in self.turns]
+
+    def turn_events_snapshot(self, turn_number: int) -> list[dict[str, Any]]:
+        with self._lock:
+            turn = next((item for item in self.turns if item.get("turn") == turn_number), None)
+            return deepcopy(turn.get("events", [])) if turn is not None else []
+
+    def _project(self, row: dict[str, Any]) -> None:
+        kind = str(row.get("type", ""))
+        if kind == "user_prompt":
+            turn = {
+                "turn": len(self.turns) + 1,
+                "time": row.get("time", ""),
+                "prompt": row.get("text", ""),
+                "reply": "",
+                "status": "running",
+                "stop_reason": "",
+                "events": [],
+            }
+            self.turns.append(turn)
+            self._active_turn = turn
+            turn["events"].append(_presentation_row(row))
+            return
+        turn = self._active_turn
+        if turn is None:
+            return
+        if kind == "turn_stopped":
+            turn["events"].append(_presentation_row(row))
+            stop_reason = str(row.get("status", "") or "")
+            turn["stop_reason"] = stop_reason
+            turn["status"] = stop_reason or "stopped"
+            self._active_turn = None
+            return
+        _merge_presentation_row(turn["events"], row)
+        turn["reply"] = "\n\n".join(
+            str(event.get("text", ""))
+            for event in turn["events"]
+            if event.get("group") == "assistant"
+        )
 
     def _events_path(self) -> Path:
         safe_session = hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()[:24]
@@ -185,3 +255,61 @@ def _terminal_id(raw: dict[str, Any]) -> str:
         if isinstance(item, dict) and item.get("type") == "terminal":
             return str(item.get("terminalId", ""))
     return ""
+
+
+def _presentation_row(row: dict[str, Any], *, group: str = "") -> dict[str, Any]:
+    projected = {key: value for key, value in row.items() if key != "raw"}
+    projected["group"] = group
+    return projected
+
+
+def _message_group(kind: str) -> str:
+    if kind.endswith("thought_chunk"):
+        return "thought"
+    if kind.endswith("message_chunk") and ("agent" in kind or "assistant" in kind):
+        return "assistant"
+    return ""
+
+
+def _merge_presentation_row(events: list[dict[str, Any]], row: dict[str, Any]) -> None:
+    kind = str(row.get("type", ""))
+    group = _message_group(kind)
+    if group and events and events[-1].get("group") == group:
+        events[-1]["text"] = str(events[-1].get("text", "")) + str(row.get("text", ""))
+        events[-1]["time"] = row.get("time", events[-1].get("time", ""))
+        return
+
+    tool_call_id = str(row.get("tool_call_id", "") or "")
+    if tool_call_id and kind in {"tool_call", "tool_call_update"}:
+        existing = next(
+            (event for event in reversed(events) if event.get("tool_call_id") == tool_call_id),
+            None,
+        )
+        if existing is not None:
+            _update_projected_row(existing, row)
+            existing["group"] = "tool"
+            return
+        group = "tool"
+
+    terminal_id = str(row.get("terminal_id", "") or "")
+    if terminal_id:
+        existing = next(
+            (event for event in reversed(events) if event.get("terminal_id") == terminal_id),
+            None,
+        )
+        if existing is not None:
+            _update_projected_row(existing, row)
+            existing["group"] = "terminal"
+            return
+        group = "terminal"
+
+    events.append(_presentation_row(row, group=group))
+
+
+def _update_projected_row(existing: dict[str, Any], row: dict[str, Any]) -> None:
+    for key in ("time", "type", "title", "status", "text"):
+        value = row.get(key)
+        if value not in (None, ""):
+            existing[key] = value
+    if row.get("diffs"):
+        existing["diffs"] = row["diffs"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import sys
 import threading
@@ -158,3 +159,88 @@ def test_available_command_completion_includes_standard_input_hint(tmp_path: Pat
     )["items"][0]
     assert item["text"] == "/skills"
     assert item["detail"] == "List available skills — input: optional filter"
+
+
+def test_refresh_requests_are_coalesced_and_preserve_tail_choice(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    app = ACPApplication(_payload(tmp_path))
+    queued = []
+    monkeypatch.setattr("jusi_acp.application.queue_action", queued.append)
+    app._last_refresh = 0.0
+
+    for _ in range(20):
+        app._refresh(follow_tail=True)
+
+    assert len(queued) == 1
+
+    class FakeSheet:
+        def __init__(self) -> None:
+            self.rows = [{}, {}, {}]
+            self.cursorRowIndex = 2
+            self.recalculated = 0
+
+        def recalc(self) -> None:
+            self.recalculated += 1
+
+    app.live_sheet = FakeSheet()
+    queued.pop()()
+    assert app.live_sheet.recalculated == 1
+    assert app.live_sheet.cursorRowIndex == 2
+
+
+def test_live_tail_is_not_followed_after_user_moves_away(tmp_path: Path) -> None:
+    app = ACPApplication(_payload(tmp_path))
+
+    class FakeSheet:
+        rows = [{}, {}, {}]
+        cursorRowIndex = 0
+
+    app.live_sheet = FakeSheet()
+    assert app._live_sheet_should_follow_tail() is False
+    app.live_sheet.cursorRowIndex = 2
+    assert app._live_sheet_should_follow_tail() is True
+
+
+def test_prompt_failure_closes_turn_and_keeps_error_event(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "session-1"
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+
+    class BrokenConnection:
+        async def prompt(self, session_id, content):  # type: ignore[no-untyped-def]
+            _ = session_id, content
+            raise RuntimeError("agent broke")
+
+    async def run() -> None:
+        app._prompt_lock = asyncio.Lock()
+        app.connection = BrokenConnection()
+        with pytest.raises(RuntimeError, match="agent broke"):
+            await app._prompt("hello", initial=True)
+
+    asyncio.run(run())
+    turn = app.store.turns[0]
+    assert turn["status"] == "failed"
+    assert [row["type"] for row in turn["events"]][-2:] == ["turn_error", "turn_stopped"]
+
+
+def test_asyncio_background_errors_are_queued_for_visidata(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    app = ACPApplication(_payload(tmp_path))
+    queued = []
+    monkeypatch.setattr("jusi_acp.application.queue_action", queued.append)
+    error = RuntimeError("background broke")
+
+    loop = asyncio.new_event_loop()
+    try:
+        app._handle_asyncio_exception(loop, {"exception": error})
+    finally:
+        loop.close()
+
+    assert app.store.rows[-1]["title"] == "ACP background task failed"
+    assert app.store.rows[-1]["status"] == "failed"
+    with pytest.raises(RuntimeError, match="background broke"):
+        queued[-1]()

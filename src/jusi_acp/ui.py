@@ -8,11 +8,13 @@ import threading
 from typing import Any, Callable
 
 _ACTIONS: deque[Callable[[], object]] = deque()
+_ACTIONS_LOCK = threading.Lock()
 _INSTALLED = False
 
 
 def queue_action(action: Callable[[], object]) -> None:
-    _ACTIONS.append(action)
+    with _ACTIONS_LOCK:
+        _ACTIONS.append(action)
     try:
         from visidata import vd
         vd.queueCommand("jusi-acp-run-pending-action")
@@ -33,8 +35,25 @@ def install_api() -> None:
     @BaseSheet.command("", "jusi-acp-run-pending-action", "run pending ACP UI actions", replay=False)
     def _run(sheet: Any) -> None:
         _ = sheet
-        while _ACTIONS:
-            _ACTIONS.popleft()()
+        from visidata import vd
+        while True:
+            with _ACTIONS_LOCK:
+                if not _ACTIONS:
+                    break
+                action = _ACTIONS.popleft()
+            try:
+                action()
+            except BaseException as exc:
+                vd.exceptionCaught(exc)
+
+    @BaseSheet.command("", "jusi-acp-start-runtime", "start the ACP runtime", replay=False)
+    def _start(sheet: Any) -> None:
+        runtime = getattr(sheet, "runtime", None)
+        if runtime is None:
+            runtime = getattr(vd, "_jusi_acp_runtime", None)
+        if runtime is None:
+            raise RuntimeError("No ACP runtime is bound to the current VisiData session")
+        runtime.start()
 
     _INSTALLED = True
 
@@ -48,7 +67,9 @@ class PendingPermission:
     options: list[Any]
 
 
-def make_events_sheet(runtime: Any) -> Any:
+def make_events_sheet(
+    runtime: Any, rows: list[dict[str, Any]] | None = None, *, name: str | None = None
+) -> Any:
     from visidata import ItemColumn, Sheet
 
     class ACPEventsSheet(Sheet):  # type: ignore[misc, valid-type]
@@ -59,8 +80,8 @@ def make_events_sheet(runtime: Any) -> Any:
             return runtime.open_event(row)
 
     sheet = ACPEventsSheet(
-        f"acp:{runtime.alias}",
-        rows=runtime.store.rows,
+        name or f"acp:{runtime.alias}",
+        rows=runtime.store.raw_snapshot() if rows is None else rows,
         columns=[
             ItemColumn("time", width=20),
             ItemColumn("source", width=8),
@@ -73,6 +94,36 @@ def make_events_sheet(runtime: Any) -> Any:
     sheet.addCommand(
         "c", "jusi-acp-cancel", "vd._jusi_acp_runtime.cancel_initial()",
         "cancel active ACP turn",
+    )
+    sheet.runtime = runtime
+    return sheet
+
+
+def make_turns_sheet(runtime: Any) -> Any:
+    from visidata import ItemColumn, Sheet
+
+    class ACPTurnsSheet(Sheet):  # type: ignore[misc, valid-type]
+        rowtype = "ACP turn"
+
+        def openRow(self, row: dict[str, Any], rowidx: int | None = None) -> Any:  # type: ignore[override]
+            _ = rowidx
+            turn_number = int(row.get("turn", 0))
+            return make_events_sheet(
+                runtime,
+                runtime.store.turn_events_snapshot(turn_number),
+                name=f"acp:{runtime.alias}:turn-{turn_number}",
+            )
+
+    sheet = ACPTurnsSheet(
+        f"acp_turns:{runtime.alias}",
+        rows=runtime.store.turns_snapshot(),
+        columns=[
+            ItemColumn("turn", width=8),
+            ItemColumn("prompt", width=40),
+            ItemColumn("reply", width=60),
+            ItemColumn("status", width=14),
+            ItemColumn("time", width=20),
+        ],
     )
     sheet.runtime = runtime
     return sheet

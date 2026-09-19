@@ -119,6 +119,11 @@ globally.
 - ACP remains authoritative for conversation context. The family stores a
   normalized read-only presentation cache so resume-only sessions retain useful
   review history.
+- The live event view groups adjacent assistant and thought chunks, consolidates
+  tool updates by call ID, and updates terminal output in place while retaining
+  every raw ACP update in the durable journal.
+- Completed prompts appear as one row each in a turns sheet. Enter opens that
+  turn's grouped event view; turn completion returns focus to the summary.
 
 The first turn begins inside the terminal application after Jusi creates the
 client. It is cancellable with the application's `c` command or `/cancel`, but

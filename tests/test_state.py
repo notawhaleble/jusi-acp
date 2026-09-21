@@ -85,3 +85,16 @@ def test_cached_raw_journal_rebuilds_turn_summaries(tmp_path: Path, monkeypatch)
     assert resumed.turns[0]["reply"] == "hi"
     assert resumed.turns[0]["status"] == "end_turn"
     assert all(row["cached"] is True for row in resumed.rows)
+
+
+def test_tool_input_and_command_survive_partial_updates(tmp_path):
+    store = EventStore("fixture", tmp_path)
+    store.add({"kind": "user_prompt", "text": "inspect"})
+    store.add({"sessionUpdate": "tool_call", "toolCallId": "one", "title": "Shell",
+               "kind": "execute", "rawInput": {"command": "ls -la"}, "status": "pending"})
+    store.add({"sessionUpdate": "tool_call_update", "toolCallId": "one", "status": "completed"})
+    row = store.turn_events_snapshot(1)[1]
+    assert row["command"] == "ls -la"
+    assert row["tool"] == "execute"
+    assert row["raw"]["rawInput"] == {"command": "ls -la"}
+    assert row["status"] == "completed"

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import sys
 
 from acp import PROTOCOL_VERSION, run_agent
 from acp.helpers import update_agent_message_text
@@ -30,8 +33,15 @@ class FakeAgent:
                 load_session=True,
                 session_capabilities=SessionCapabilities(resume={}, close={}, additional_directories={}),
             ),
+            auth_methods=[{"id": "browser", "name": "Browser"}],
             agent_info=Implementation(name="fake", title="Fake ACP Agent", version="1"),
         )
+
+    async def authenticate(self, method_id, **kwargs):
+        assert method_id == "browser"
+        assert os.environ.get("BROWSER") == "fixture-browser"
+        print("Authentication completed", file=sys.stderr, flush=True)
+        return {}
 
     async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kwargs):  # type: ignore[no-untyped-def]
         _ = cwd, additional_directories, mcp_servers, kwargs
@@ -52,7 +62,40 @@ class FakeAgent:
 
     async def prompt(self, session_id, prompt, **kwargs):  # type: ignore[no-untyped-def]
         _ = kwargs
-        text = prompt[0].text
+        text = prompt[0].text.strip()
+        if text.startswith("questions"):
+            self.cancelled.clear()
+            questions = [{
+                "question": "Which project type?", "header": "Project",
+                "options": [{"label": "Library", "description": "Reusable package"},
+                            {"label": "Application", "description": "Runnable program"}],
+            }]
+            if text == "questions-many":
+                questions.append({"question": "Any implementation details?", "options": []})
+            for round_number in range(2 if text == "questions-again" else 1):
+                response = await self.client._conn.send_request("session/request_permission", {
+                    "sessionId": session_id,
+                    "toolCall": {"toolCallId": f"question-{round_number}", "title": "Choose project type",
+                        "kind": "other", "status": "pending", "rawInput": {"questions": questions}},
+                    "options": [{"optionId": "proceed_once", "name": "Proceed", "kind": "allow_once"},
+                                {"optionId": "cancel", "name": "Cancel", "kind": "reject_once"}],
+                })
+                if response["outcome"]["outcome"] == "cancelled":
+                    return PromptResponse(stop_reason="cancelled")
+                await self.client.session_update(session_id, update_agent_message_text(
+                    "ANSWERS:" + json.dumps(response.get("answers", {}), ensure_ascii=False)))
+            if text == "questions-wait":
+                await self.client.session_update(session_id, update_agent_message_text("AFTER-ANSWERS"))
+                await self.cancelled.wait()
+                return PromptResponse(stop_reason="cancelled")
+            return PromptResponse(stop_reason="end_turn")
+        if text == "ui-idle":
+            await asyncio.sleep(2)
+            await self.client.session_update(session_id, update_agent_message_text("AUTOMATIC-STREAM"))
+            await asyncio.sleep(2)
+            await self.client._conn.send_notification("fixture/unknown", {})
+            await asyncio.sleep(0.2)
+            return PromptResponse(stop_reason="end_turn")
         if text == "wait":
             self.cancelled.clear()
             await self.cancelled.wait()

@@ -69,6 +69,9 @@ class EventStore:
             "status": str(raw.get("status", raw.get("stopReason", "")) or ""),
             "text": _text(raw),
             "tool_call_id": str(raw.get("toolCallId", "") or ""),
+            "tool": str((raw.get("_meta") or {}).get("toolName", raw.get("name", raw.get("kind", "")))) if kind in {"tool_call", "tool_call_update"} else "",
+            "command": _command(raw),
+            "input": _display_value(raw.get("rawInput")),
             "terminal_id": _terminal_id(raw),
             "diffs": _diffs(raw),
             "raw": raw,
@@ -83,7 +86,7 @@ class EventStore:
     def add_status(self, title: str, text: str = "", status: str = "") -> dict[str, Any]:
         return self.add({"kind": "status", "title": title, "text": text, "status": status}, source="client")
 
-    def update_terminal(self, terminal_id: str, output: str, truncated: bool, status: str = "") -> None:
+    def update_terminal(self, terminal_id: str, output: str, truncated: bool, status: str = "", *, command: str = "") -> None:
         row = {
             "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "source": "client",
@@ -93,11 +96,14 @@ class EventStore:
             "text": output,
             "tool_call_id": "",
             "terminal_id": terminal_id,
+            "command": command,
+            "tool": "terminal",
             "diffs": [],
             "raw": {
                 "kind": "terminal",
                 "terminalId": terminal_id,
                 "output": output,
+                "command": command,
                 "truncated": truncated,
                 "status": status,
             },
@@ -111,6 +117,9 @@ class EventStore:
             if existing is None:
                 self.rows.append(row)
             else:
+                if not command:
+                    row["command"] = existing.get("command", "")
+                    row["raw"]["command"] = row["command"]
                 existing.update(row)
             self._project(row)
         if status != "running":
@@ -143,6 +152,7 @@ class EventStore:
                 "time": row.get("time", ""),
                 "prompt": row.get("text", ""),
                 "reply": "",
+                "model": row.get("raw", {}).get("model", ""),
                 "status": "running",
                 "stop_reason": "",
                 "events": [],
@@ -154,6 +164,12 @@ class EventStore:
         turn = self._active_turn
         if turn is None:
             return
+        if kind in {"question_waiting", "questions_resumed"}:
+            turn["status"] = row.get("status", "running")
+        if kind == "config_option_update":
+            for option in row.get("raw", {}).get("configOptions", []):
+                if option.get("category") == "model" or option.get("id") == "model":
+                    turn["model"] = str(option.get("currentValue", ""))
         if kind == "turn_stopped":
             turn["events"].append(_presentation_row(row))
             stop_reason = str(row.get("status", "") or "")
@@ -191,6 +207,8 @@ def _json_value(value: Any) -> dict[str, Any]:
 def _title(raw: dict[str, Any], kind: str) -> str:
     if raw.get("title"):
         return str(raw["title"])
+    if kind == "tool_call_update":
+        return ""
     if kind == "plan":
         return "Plan"
     if kind.endswith("message_chunk"):
@@ -258,7 +276,7 @@ def _terminal_id(raw: dict[str, Any]) -> str:
 
 
 def _presentation_row(row: dict[str, Any], *, group: str = "") -> dict[str, Any]:
-    projected = {key: value for key, value in row.items() if key != "raw"}
+    projected = deepcopy(row)
     projected["group"] = group
     return projected
 
@@ -307,9 +325,24 @@ def _merge_presentation_row(events: list[dict[str, Any]], row: dict[str, Any]) -
 
 
 def _update_projected_row(existing: dict[str, Any], row: dict[str, Any]) -> None:
-    for key in ("time", "type", "title", "status", "text"):
+    for key in ("time", "type", "title", "status", "text", "tool", "command", "input"):
         value = row.get(key)
         if value not in (None, ""):
             existing[key] = value
+    existing.setdefault("raw", {}).update(row.get("raw", {}))
     if row.get("diffs"):
         existing["diffs"] = row["diffs"]
+
+
+def _display_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def _command(raw: dict[str, Any]) -> str:
+    value = raw.get("rawInput")
+    if isinstance(value, dict):
+        command = value.get("command", value.get("cmd", ""))
+        return _display_value(command)
+    return ""

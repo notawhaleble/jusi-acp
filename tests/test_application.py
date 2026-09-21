@@ -244,3 +244,243 @@ def test_asyncio_background_errors_are_queued_for_visidata(
     assert app.store.rows[-1]["status"] == "failed"
     with pytest.raises(RuntimeError, match="background broke"):
         queued[-1]()
+
+
+def test_browser_environment_reaches_auth_process(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("BROWSER", "fixture-browser")
+    payload = _payload(tmp_path)
+    payload["launch"]["auth_method"] = "browser"
+    app = ACPApplication(payload)
+    app.start()
+    try:
+        assert app._connected.wait(10)
+        assert app._failed is None
+        assert app.session_id == "fake-session"
+        assert any(row["title"] == "Authenticated" for row in app.store.rows)
+    finally:
+        app.close()
+
+
+def test_model_snapshot_is_retained_per_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "session"
+
+    class Connection:
+        async def prompt(self, *args):
+            return SimpleNamespace(stop_reason="end_turn")
+
+    async def run():
+        app.connection = Connection()
+        app._prompt_lock = asyncio.Lock()
+        for model in ("first", "second"):
+            app.config_options = [SimpleNamespace(category="model", current_value=model)]
+            await app._prompt("hello", initial=False)
+
+    asyncio.run(run())
+    assert [row["model"] for row in app.store.turns_snapshot()] == ["first", "second"]
+
+
+def test_sdk_logging_reaches_error_history_without_stderr(tmp_path, monkeypatch, capsys):
+    import logging
+    from jusi_acp.application import _ApplicationLogHandler
+    from acp import RequestError
+    from jusi_acp.ui import drain_actions
+    from visidata import vd
+
+    from collections import deque
+    monkeypatch.setattr("jusi_acp.ui._ACTIONS", deque())
+    monkeypatch.setattr(vd, "status", lambda *args, **kwargs: None)
+    app = ACPApplication(_payload(tmp_path))
+    monkeypatch.setattr(app, "_refresh", lambda **kwargs: None)
+    logger = logging.getLogger("test-acp-routing")
+    monkeypatch.setattr(logger, "handlers", [_ApplicationLogHandler(app)])
+    monkeypatch.setattr(logger, "propagate", False)
+    try:
+        raise RequestError.method_not_found("fixture/unknown")
+    except RequestError:
+        logger.exception("Unhandled notification method=fixture/unknown")
+    drain_actions()
+    assert "fixture/unknown" in app.store.rows[-1]["text"]
+    assert "RequestError" in "\n".join(vd.lastErrors[-1])
+    assert capsys.readouterr().err == ""
+
+
+def test_legacy_model_response_is_preserved_before_sdk_validation(tmp_path):
+    app = ACPApplication(_payload(tmp_path))
+    app._observe_protocol(SimpleNamespace(direction="incoming", message={
+        "id": 1, "result": {"sessionId": "fake-session", "models": {"currentModelId": "giga-model"}},
+    }))
+    assert app._current_model() == "giga-model"
+
+
+def test_question_waits_for_answers_and_can_be_cancelled(tmp_path, monkeypatch):
+    from acp.schema import PermissionOption, ToolCallUpdate
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "session"
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+
+    async def run():
+        task = asyncio.create_task(app.request_permission("session", ToolCallUpdate(
+            tool_call_id="question", raw_input={"questions": [{"question": "Which?", "options": []}]},
+        ), [PermissionOption(option_id="allow", kind="allow_once", name="Answer")]))
+        await asyncio.sleep(0)
+        assert not task.done()
+        app._cancel_permissions()
+        response = await asyncio.wait_for(task, 1)
+        assert response.outcome.outcome == "cancelled"
+        assert not app._permissions
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("initial", [False, True])
+def test_questions_are_answered_by_followups_in_the_same_turn(tmp_path, monkeypatch, initial):
+    import json
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path, "questions-many" if initial else ""))
+    app.start()
+    try:
+        assert app._connected.wait(10)
+        if initial:
+            deadline = time.monotonic() + 5
+            while app._answer_state is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            waiting = app._answer_state
+        else:
+            waiting = app.handle_operation("followup", {"body": "questions-many"})
+        assert waiting["status"] == "awaiting_answer"
+        assert waiting["question_number"] == 1
+        assert app.store.turns_snapshot()[0]["status"] == "awaiting_answer"
+        with pytest.raises(ValueError, match="empty"):
+            app.handle_operation("followup", {"body": " \n "})
+        assert not app._questions[waiting["request_id"]].answers
+        completions = app.handle_operation("complete", {"prefix": "App", "cursor_pos": 3})
+        assert validate_completion(completions, 3) == completions
+        assert completions["items"][0]["text"] == "Application"
+        waiting = app.handle_operation("followup", {"body": "Application"})
+        assert waiting["question_number"] == 2
+        answer = "  Keep this indentation.\nα and β\n/config is literal answer text here.  "
+        result = app.handle_operation("followup", {"body": answer})
+        assert result["stop_reason"] == "end_turn"
+        expected = {"0": "Application", "1": answer}
+        replies = [row["text"] for row in app.store.raw_snapshot() if row["type"] == "agent_message_chunk"]
+        assert json.loads(replies[0].removeprefix("ANSWERS:")) == expected
+        assert len(app.store.turns_snapshot()) == 1
+        answers = [row["text"] for row in app.store.turn_events_snapshot(1) if row["type"] == "question_answer"]
+        assert answers == ["Application", answer]
+        assert app.handle_operation("followup", {"body": "normal again"})["session_id"] == "fake-session"
+        assert len(app.store.turns_snapshot()) == 2
+    finally:
+        app.close()
+
+
+def test_second_question_request_releases_followup_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        first = app.handle_operation("followup", {"body": "questions-again"})
+        second = app.handle_operation("followup", {"body": "/mode is an answer"})
+        assert second["status"] == "awaiting_answer"
+        assert first["request_id"] != second["request_id"]
+        assert app.handle_operation("followup", {"body": "Library"})["stop_reason"] == "end_turn"
+        assert len(app.store.turns_snapshot()) == 1
+    finally:
+        app.close()
+
+
+def test_cancel_waiting_questions_from_followup_preserves_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        app.handle_operation("followup", {"body": "questions-many"})
+        app.handle_operation("followup", {"body": "Application"})
+        assert app.handle_operation("followup", {"body": "/cancel"}) == {"command": "cancel"}
+        assert app._answer_state is None
+        assert not app._questions
+        assert app.store.turns_snapshot()[0]["status"] == "cancelled"
+        assert app.handle_operation("followup", {"body": "healthy"})["stop_reason"] == "end_turn"
+    finally:
+        app.close()
+
+
+def test_resumed_answer_operation_is_interruptible(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    errors = []
+    def answer():
+        try:
+            app.handle_operation("followup", {"body": "Application"})
+        except BaseException as exc:
+            errors.append(exc)
+    try:
+        app.handle_operation("followup", {"body": "questions-wait"})
+        thread = threading.Thread(target=answer)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while not any(row["text"] == "AFTER-ANSWERS" for row in app.store.raw_snapshot()) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        app.handle_operation("interrupt", {})
+        thread.join(5)
+        assert not thread.is_alive()
+        assert len(errors) == 1 and isinstance(errors[0], InterruptedError)
+        assert app.handle_operation("followup", {"body": "healthy"})["stop_reason"] == "end_turn"
+    finally:
+        app.close()
+
+
+def test_interrupt_before_answer_submission_does_not_answer_question(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        app.handle_operation("followup", {"body": "questions"})
+        app.handle_operation("begin_followup", {})
+        app.handle_operation("interrupt", {})
+        with pytest.raises(InterruptedError):
+            app.handle_operation("followup", {"body": "must not be sent"})
+        deadline = time.monotonic() + 5
+        while not app._turn_task.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not any(row["type"] == "question_answer" for row in app.store.raw_snapshot())
+        assert app.handle_operation("followup", {"body": "healthy"})["stop_reason"] == "end_turn"
+    finally:
+        app.close()
+
+
+def test_finished_turn_cancels_outstanding_question_target(tmp_path, monkeypatch):
+    from acp.schema import PermissionOption, ToolCallUpdate
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "session"
+
+    async def run():
+        finish = asyncio.Event()
+        permission_task = None
+        class Connection:
+            async def prompt(self, *args):
+                nonlocal permission_task
+                permission_task = asyncio.create_task(app.request_permission("session", ToolCallUpdate(
+                    tool_call_id="question", raw_input={"questions": [{"question": "Which?", "options": []}]},
+                ), [PermissionOption(option_id="allow", kind="allow_once", name="Answer")]))
+                await finish.wait()
+                return SimpleNamespace(stop_reason="end_turn")
+        app.connection = Connection()
+        app._prompt_lock = asyncio.Lock()
+        result = await app._prompt_or_command("ask", initial=True)
+        assert result["status"] == "awaiting_answer"
+        finish.set()
+        await app._turn_task
+        assert app._answer_state is None
+        assert not app._questions
+        assert (await permission_task).outcome.outcome == "cancelled"
+    asyncio.run(run())

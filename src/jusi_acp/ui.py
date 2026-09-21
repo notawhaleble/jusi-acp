@@ -1,7 +1,6 @@
 """VisiData presentation and feedback surfaces for the shared ACP client."""
 from __future__ import annotations
 
-import curses
 from dataclasses import dataclass
 from collections import deque
 import threading
@@ -15,46 +14,37 @@ _INSTALLED = False
 def queue_action(action: Callable[[], object]) -> None:
     with _ACTIONS_LOCK:
         _ACTIONS.append(action)
-    try:
-        from visidata import vd
-        vd.queueCommand("jusi-acp-run-pending-action")
-    except Exception:
-        pass
-    try:
-        curses.ungetch(curses.KEY_RESIZE)
-    except Exception:
-        pass
+
+
+def drain_actions() -> None:
+    """Run a bounded snapshot on the drawing thread, never through command replay."""
+    from visidata import vd
+    with _ACTIONS_LOCK:
+        actions = list(_ACTIONS)
+        _ACTIONS.clear()
+    for action in actions:
+        try:
+            action()
+        except Exception as exc:
+            vd.exceptionCaught(exc)
 
 
 def install_api() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    from visidata import BaseSheet
+    from visidata import vd
 
-    @BaseSheet.command("", "jusi-acp-run-pending-action", "run pending ACP UI actions", replay=False)
-    def _run(sheet: Any) -> None:
-        _ = sheet
-        from visidata import vd
-        while True:
-            with _ACTIONS_LOCK:
-                if not _ACTIONS:
-                    break
-                action = _ACTIONS.popleft()
-            try:
-                action()
-            except BaseException as exc:
-                vd.exceptionCaught(exc)
+    # ACP uses an independent asyncio thread, invisible to unfinishedThreads.
+    # Keep curses polling; ungetch from another thread cannot wake a blocked read.
+    vd.timeouts_before_idle = -1
+    original_draw = vd.draw_all
 
-    @BaseSheet.command("", "jusi-acp-start-runtime", "start the ACP runtime", replay=False)
-    def _start(sheet: Any) -> None:
-        runtime = getattr(sheet, "runtime", None)
-        if runtime is None:
-            runtime = getattr(vd, "_jusi_acp_runtime", None)
-        if runtime is None:
-            raise RuntimeError("No ACP runtime is bound to the current VisiData session")
-        runtime.start()
+    def draw_all() -> None:
+        drain_actions()
+        original_draw()
 
+    vd.draw_all = draw_all
     _INSTALLED = True
 
 
@@ -65,6 +55,8 @@ class PendingPermission:
     kind: str
     locations: str
     options: list[Any]
+    details: str = ""
+    questions: list[dict[str, Any]] | None = None
 
 
 def make_events_sheet(
@@ -83,12 +75,15 @@ def make_events_sheet(
         name or f"acp:{runtime.alias}",
         rows=runtime.store.raw_snapshot() if rows is None else rows,
         columns=[
+            ItemColumn("type", width=20),
+            ItemColumn("title", width=24),
+            ItemColumn("text", width=80),
+            ItemColumn("status", width=12),
+            ItemColumn("tool", width=22),
+            ItemColumn("command", width=45),
+            ItemColumn("input", width=60),
             ItemColumn("time", width=20),
             ItemColumn("source", width=8),
-            ItemColumn("type", width=25),
-            ItemColumn("title", width=32),
-            ItemColumn("status", width=12),
-            ItemColumn("text", width=80),
         ],
     )
     sheet.addCommand(
@@ -119,9 +114,10 @@ def make_turns_sheet(runtime: Any) -> Any:
         rows=runtime.store.turns_snapshot(),
         columns=[
             ItemColumn("turn", width=8),
+            ItemColumn("model", width=24),
+            ItemColumn("status", width=14),
             ItemColumn("prompt", width=40),
             ItemColumn("reply", width=60),
-            ItemColumn("status", width=14),
             ItemColumn("time", width=20),
         ],
     )
@@ -138,6 +134,7 @@ def make_permission_sheet(runtime: Any, pending: PendingPermission) -> Any:
         "option_id": option.option_id,
         "tool": pending.title,
         "locations": pending.locations,
+        "details": pending.details,
     } for option in pending.options]
 
     class PermissionSheet(Sheet):  # type: ignore[misc, valid-type]
@@ -149,6 +146,10 @@ def make_permission_sheet(runtime: Any, pending: PendingPermission) -> Any:
             from visidata import vd
             vd.quit(self)
 
+        def show_details(self) -> None:
+            from visidata import vd, TextSheet
+            vd.push(TextSheet(pending.title, source=pending.details.splitlines()))
+
     sheet = PermissionSheet(
         f"permission:{pending.title}",
         rows=rows,
@@ -156,6 +157,7 @@ def make_permission_sheet(runtime: Any, pending: PendingPermission) -> Any:
             ItemColumn("name", width=28),
             ItemColumn("kind", width=16),
             ItemColumn("tool", width=40),
+            ItemColumn("details", width=80),
             ItemColumn("locations", width=60),
         ],
     )
@@ -164,6 +166,7 @@ def make_permission_sheet(runtime: Any, pending: PendingPermission) -> Any:
         "vd._jusi_acp_runtime.select_permission(sheet.jusi_acp_permission_id, None); vd.quit(sheet)",
         "deny the pending permission and close this sheet",
     )
+    sheet.addCommand("d", "jusi-acp-permission-details", "sheet.show_details()", "read complete tool request")
     sheet.jusi_acp_permission_id = pending.request_id
     return sheet
 
@@ -187,3 +190,18 @@ def make_diffs_sheet(runtime: Any, diffs: list[dict[str, Any]]) -> Any:
             ItemColumn("new_text", width=40),
         ],
     )
+
+
+def make_questions_sheet(runtime: Any, state: dict[str, Any]) -> Any:
+    from visidata import TextSheet
+    from .questions import question_text
+
+    sheet = TextSheet(
+        f"Answer in Jusi follow-up ({state['question_number']}/{state['question_count']})",
+        source=question_text(state).splitlines(),
+    )
+    sheet.options.wrap = True
+    sheet.addCommand("c", "jusi-acp-cancel-waiting-turn", "sheet.runtime.cancel_initial()",
+                     "cancel the waiting ACP turn")
+    sheet.runtime = runtime
+    return sheet

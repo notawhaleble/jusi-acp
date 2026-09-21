@@ -137,3 +137,50 @@ python3.12 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
+
+The notebook follow-up integration test uses a sibling `jusi` frontend checkout,
+or the path supplied in `JUSI_NVIM_ROOT`, together with the installed Python
+backend. It edits notebook cells through Neovim and checks the real serialized
+follow-up lane, answer history, and same-client reuse.
+
+### Turn review and questions
+
+The turns sheet records the model ID reported by the agent, from either model
+configuration or older ACP session model metadata. It stays blank when the
+agent does not report a model; it is not inferred from the executable name.
+Tool events show the tool name/kind, command, and raw input when supplied.
+Enter opens the full event details (or the existing diff view).
+
+Qwen/GigaCode question requests carried in `rawInput.questions` pause the agent
+and show the current question and choices in a read-only view. Type your answer
+in the notebook cell in Vim and submit it using the usual Jusi follow-up action.
+Each follow-up answers one question. Write the option label (available in cell
+completion) or any free-form, multiline answer; text and whitespace are preserved.
+For multiple-choice questions, describe all your choices in the answer. An empty
+answer is rejected without advancing to the next question.
+
+When a question arrives, the current Jusi operation returns successfully with
+`status: awaiting_answer`, freeing the follow-up lane while keeping the ACP
+request pending. After the last answer, that same ACP turn resumes, and the
+answer follow-up stays active until the turn finishes or asks another question.
+Answers remain in the original turn's event history and in normal Jusi follow-up
+history; they never become separate agent prompts. Once the turn finishes, the
+next follow-up starts a new prompt as usual.
+
+Submit `/cancel` from the cell to cancel a waiting turn, including any partially
+answered question set. Closing the question view just hides it; it does not
+answer or cancel anything. While waiting, all other cell text is an answer,
+including slash-prefixed text. During resumed work, use `:JusiInterrupt` as usual.
+While waiting for input there is no active Jusi operation to interrupt, so use
+`/cancel` (or `c` in the question view). No text entry in VisiData is required.
+
+Ordinary tool permission requests retain their approval choices, with `d`
+exposing the full request payload. Questions use the
+[Qwen permission extension](https://github.com/QwenLM/qwen-code/blob/main/packages/vscode-ide-companion/src/services/acpConnection.ts),
+not generic ACP elicitation.
+
+ACP UI updates run from the drawing thread with a bounded curses polling interval,
+including while the terminal has no focus. SDK logging goes to event diagnostics
+and VisiData's Ctrl-E error history. Agent stderr appears as labelled diagnostic
+events, including during authentication. Browser launcher environment variables
+are preserved, and provider environment overrides take precedence.

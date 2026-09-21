@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future as ConcurrentFuture
 import json
+import logging
 import os
 from pathlib import Path
 import shlex
@@ -26,6 +27,7 @@ from acp.schema import (
 from . import __version__
 from .ipc import ApplicationController
 from .state import EventStore
+from .questions import QuestionRequest, question_text
 from .terminal import TerminalManager
 from .ui import (
     PendingPermission,
@@ -33,6 +35,7 @@ from .ui import (
     make_diffs_sheet,
     make_events_sheet,
     make_permission_sheet,
+    make_questions_sheet,
     make_turns_sheet,
     queue_action,
 )
@@ -77,10 +80,16 @@ class ACPApplication:
         self.connection: Any = None
         self.initialize_response: Any = None
         self.session_id = ""
+        self._reported_model = ""
         self.session_modes: Any = None
         self.config_options: list[Any] = []
         self.available_commands: list[Any] = []
         self._prompt_lock: asyncio.Lock | None = None
+        self._turn_task: asyncio.Task[dict[str, Any]] | None = None
+        self._questions: dict[str, QuestionRequest] = {}
+        self._question_changed = asyncio.Event()
+        self._answer_state: dict[str, Any] | None = None
+        self.questions_sheet: Any = None
         self._shutdown: asyncio.Event | None = None
         self._connected = threading.Event()
         self._failed: BaseException | None = None
@@ -130,22 +139,46 @@ class ACPApplication:
         locations = ", ".join(
             str(getattr(location, "path", "")) for location in (getattr(tool_call, "locations", None) or [])
         )
+        raw_input = getattr(tool_call, "raw_input", None)
+        questions = raw_input.get("questions") if isinstance(raw_input, dict) else None
+        if not isinstance(questions, list) or not questions or not all(isinstance(q, dict) for q in questions):
+            questions = None
         pending = PendingPermission(
             request_id=request_id,
             title=str(getattr(tool_call, "title", None) or getattr(tool_call, "tool_call_id", "Tool call")),
             kind=str(getattr(tool_call, "kind", "") or ""),
             locations=locations,
             options=options,
+            questions=questions,
+            details=json.dumps(tool_call.model_dump(mode="json", by_alias=True, exclude_none=True),
+                               ensure_ascii=False, indent=2),
         )
-        self.store.add_status("Permission required", pending.title, "pending")
-        queue_action(lambda: self._push_permission(pending))
+        self.store.add_status("Answers required" if questions else "Permission required", pending.details, "pending")
+        self._refresh()
+        if questions:
+            option = next((option for option in options if option.kind == "allow_once"), None)
+            if option is None:
+                with self._permission_lock:
+                    self._permissions.pop(request_id, None)
+                raise RequestError.invalid_params({"details": "Questions require an allow_once response option"})
+            self._questions[request_id] = QuestionRequest(request_id, questions, option.option_id)
+            self._publish_question()
+        else:
+            queue_action(lambda: self._push_permission(pending))
         try:
             option_id = await future
         finally:
             with self._permission_lock:
                 self._permissions.pop(request_id, None)
+            if self._questions.pop(request_id, None) is not None:
+                self._publish_question()
         if option_id is None:
             return RequestPermissionResponse(outcome={"outcome": "cancelled"})
+        if isinstance(option_id, dict):
+            return QuestionPermissionResponse(
+                outcome={"outcome": "selected", "optionId": option_id["option_id"]},
+                answers=option_id["answers"],
+            )
         return RequestPermissionResponse(outcome={"outcome": "selected", "optionId": option_id})
 
     async def create_terminal(
@@ -155,7 +188,8 @@ class ACPApplication:
     ) -> Any:
         _ = kwargs
         result = await self.terminals.create(session_id, command, args, env, cwd, output_byte_limit)
-        self.store.update_terminal(result.terminal_id, "", False, "running")
+        self.store.update_terminal(result.terminal_id, "", False, "running",
+                                   command=shlex.join([command, *(args or [])]))
         self._refresh()
         return result
 
@@ -180,6 +214,17 @@ class ACPApplication:
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         _ = method, params
+
+    def _observe_protocol(self, event: Any) -> None:
+        # Older ACP agents return models, which this SDK version discards while
+        # validating session responses. Preserve the reported ID at the boundary.
+        if event.direction != "incoming":
+            return
+        result = event.message.get("result")
+        if isinstance(result, dict):
+            models = result.get("models")
+            if isinstance(models, dict) and isinstance(models.get("currentModelId"), str):
+                self._reported_model = models["currentModelId"]
 
     def on_connect(self, connection: Any) -> None:
         self.connection = connection
@@ -217,8 +262,9 @@ class ACPApplication:
             self,
             self.argv[0],
             *self.argv[1:],
-            env=self.environment,
+            env={**_agent_environment(), **self.environment},
             cwd=self.cwd,
+            observers=[self._observe_protocol],
         ) as (connection, process):
             self.connection = connection
             stderr_task = asyncio.create_task(self._drain_stderr(process))
@@ -259,6 +305,9 @@ class ACPApplication:
                 await self._shutdown.wait()
                 await self._close_agent_session()
             finally:
+                if self._turn_task is not None and not self._turn_task.done():
+                    self._turn_task.cancel()
+                    await asyncio.gather(self._turn_task, return_exceptions=True)
                 await self.terminals.close()
                 stderr_task.cancel()
                 await asyncio.gather(stderr_task, return_exceptions=True)
@@ -275,6 +324,8 @@ class ACPApplication:
             retained.extend(chunk)
             if len(retained) > 65536:
                 del retained[:-65536]
+            self.store.add_status("ACP agent stderr", chunk.decode("utf-8", errors="replace"), "diagnostic")
+            self._refresh()
         if process.returncode not in (None, 0) and retained:
             self.store.add_status("ACP agent stderr", retained.decode("utf-8", errors="replace"), "failed")
 
@@ -373,6 +424,22 @@ class ACPApplication:
 
     async def _prompt_or_command(self, body: str, *, initial: bool = False) -> dict[str, Any]:
         stripped = body.strip()
+        with self._operation_lock:
+            cancelled = self._operation_cancel is not None and self._operation_cancel.is_set()
+        if cancelled:
+            raise InterruptedError("ACP turn cancelled")
+        if stripped == "/cancel":
+            self.cancel_initial()
+            if self._turn_task is not None and not self._turn_task.done():
+                try:
+                    await asyncio.shield(self._turn_task)
+                except InterruptedError:
+                    pass
+            return {"command": "cancel"}
+        if self._answer_state is not None:
+            return await self._answer_question(body)
+        if self._turn_task is not None and not self._turn_task.done():
+            raise ValueError("The ACP turn is still running; wait for a question or turn completion")
         if stripped.startswith("/mode "):
             if self.session_modes is None:
                 raise ValueError("ACP agent does not advertise session modes")
@@ -391,7 +458,8 @@ class ACPApplication:
             value: str | bool = parts[2]
             if parts[2].lower() in {"true", "false"}:
                 value = parts[2].lower() == "true"
-            await self.connection.set_config_option(parts[1], self.session_id, value)
+            response = await self.connection.set_config_option(parts[1], self.session_id, value)
+            self.config_options = list(response.config_options)
             return {"command": "config", "config_id": parts[1], "value": value}
         if stripped.startswith("/auth "):
             parts = shlex.split(stripped)
@@ -401,10 +469,71 @@ class ACPApplication:
             if not self.session_id:
                 await self._establish_session()
             return {"command": "auth", "method_id": parts[1]}
-        if stripped == "/cancel":
-            await self._cancel()
-            return {"command": "cancel"}
-        return await self._prompt(body, initial=initial)
+        if not initial:
+            self._cancel_requested.clear()
+        self._turn_task = asyncio.create_task(self._prompt(body, initial=initial))
+        # A paused turn outlives its Jusi operation. Consume unattended task
+        # exceptions; _prompt already records failures in the turn journal.
+        self._turn_task.add_done_callback(self._turn_finished)
+        return await self._wait_for_turn()
+
+    def _turn_finished(self, task: asyncio.Task[dict[str, Any]]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None and not isinstance(error, (InterruptedError, RequestError, ValueError)):
+            self._failed = error
+
+    async def _wait_for_turn(self) -> dict[str, Any]:
+        task = self._turn_task
+        assert task is not None
+        while not task.done():
+            if self._answer_state is not None and not self._cancel_requested.is_set():
+                return dict(self._answer_state)
+            self._question_changed.clear()
+            changed = asyncio.create_task(self._question_changed.wait())
+            try:
+                await asyncio.wait((task, changed), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                changed.cancel()
+                await asyncio.gather(changed, return_exceptions=True)
+        return await asyncio.shield(task)
+
+    def _publish_question(self) -> None:
+        with self._permission_lock:
+            waiting = {key for key, (_, future) in self._permissions.items() if not future.done()}
+        request = next((value for key, value in self._questions.items() if key in waiting), None)
+        self._answer_state = request.snapshot() if request is not None else None
+        self._question_changed.set()
+        state = self._answer_state
+        if state is not None:
+            self.store.add({"kind": "question_waiting", "title": "Answer in Jusi follow-up",
+                            "text": question_text(state), "status": "awaiting_answer"}, source="client")
+            queue_action(lambda: self._show_question(state))
+        else:
+            self.store.add({"kind": "questions_resumed", "title": "Questions finished",
+                            "status": "running"}, source="client")
+            queue_action(self._close_questions_sheet)
+        self._refresh()
+
+    async def _answer_question(self, body: str) -> dict[str, Any]:
+        if not body.strip():
+            raise ValueError("The answer is empty; write it in the cell and submit a follow-up")
+        state = self._answer_state
+        assert state is not None
+        request = self._questions[state["request_id"]]
+        with self._permission_lock:
+            waiting = self._permissions.get(request.request_id)
+        if waiting is None or waiting[1].done():
+            raise ValueError("This question is no longer waiting for an answer")
+        request.answers[str(len(request.answers))] = body
+        self.store.add({"kind": "question_answer", "title": f"Answer {state['question_number']}",
+                        "text": body, "question": state["question"]}, source="user")
+        if len(request.answers) == len(request.questions):
+            self._questions.pop(request.request_id)
+            _resolve_future(waiting[1], {"option_id": request.option_id, "answers": dict(request.answers)})
+        self._publish_question()
+        return await self._wait_for_turn()
 
     async def _prompt(self, body: str, *, initial: bool) -> dict[str, Any]:
         if not self.session_id:
@@ -417,7 +546,7 @@ class ACPApplication:
                 raise InterruptedError("ACP turn cancelled")
             if not initial and operation_cancel is not None and operation_cancel.is_set():
                 raise InterruptedError("ACP turn cancelled")
-            self.store.add({"kind": "user_prompt", "text": body}, source="user")
+            self.store.add({"kind": "user_prompt", "text": body, "model": self._current_model()}, source="user")
             turn = self.store.active_turn
             if turn is not None:
                 turn_number = int(turn["turn"])
@@ -438,6 +567,17 @@ class ACPApplication:
                 self._refresh()
                 queue_action(self._focus_turns_sheet)
                 raise
+            finally:
+                # Agents can stop a turn while a client request is outstanding.
+                # Never leave an answer target attached to a completed turn.
+                if self._questions:
+                    request_ids = list(self._questions)
+                    self._questions.clear()
+                    with self._permission_lock:
+                        futures = [self._permissions[key][1] for key in request_ids if key in self._permissions]
+                    for future in futures:
+                        _resolve_future(future, None)
+                    self._publish_question()
             stop_reason = str(response.stop_reason)
             self.store.add({"kind": "turn_stopped", "stopReason": stop_reason}, source="agent")
             self._refresh()
@@ -446,10 +586,16 @@ class ACPApplication:
                 self._cancel_requested.is_set()
                 if initial
                 else operation_cancel is not None and operation_cancel.is_set()
-            ) or stop_reason in {"cancelled", "canceled"}
+            ) or self._cancel_requested.is_set() or stop_reason in {"cancelled", "canceled"}
             if cancelled:
                 raise InterruptedError("ACP turn cancelled")
             return {"stop_reason": stop_reason, "session_id": self.session_id}
+
+    def _current_model(self) -> str:
+        for option in self.config_options:
+            if getattr(option, "category", None) == "model" or getattr(option, "id", None) == "model":
+                return str(getattr(option, "current_value", "") or "")
+        return self._reported_model
 
     async def _authenticate(self, method_id: str) -> None:
         methods = {item.id: item for item in self.initialize_response.auth_methods or []}
@@ -459,8 +605,11 @@ class ACPApplication:
         method_type = getattr(method, "type", None)
         if method_type is not None:
             raise ValueError(f"ACP authentication method type {method_type!r} is not supported by jusi-acp 0.1")
+        self.store.add_status("Authenticating", method_id, "pending")
+        self._refresh()
         await self.connection.authenticate(method_id)
         self.store.add_status("Authenticated", method_id, "ready")
+        self._refresh()
 
     def cancel_initial(self) -> None:
         self._cancel_requested.set()
@@ -486,7 +635,7 @@ class ACPApplication:
             self._thread.join(timeout=4)
 
     # UI and feedback ----------------------------------------------------
-    def select_permission(self, request_id: str, option_id: str | None) -> None:
+    def select_permission(self, request_id: str, option_id: str | dict[str, Any] | None) -> None:
         with self._permission_lock:
             pending = self._permissions.get(request_id)
         if pending is None:
@@ -501,12 +650,39 @@ class ACPApplication:
             loop.call_soon_threadsafe(_resolve_future, future, None)
 
     def _push_permission(self, pending: PendingPermission) -> None:
+        with self._permission_lock:
+            waiting = self._permissions.get(pending.request_id)
+        if waiting is None or waiting[1].done():
+            return
         from visidata import vd
         vd.push(make_permission_sheet(self, pending))
+
+    def _show_question(self, state: dict[str, Any]) -> None:
+        if state is not self._answer_state:
+            return
+        from visidata import vd
+        self._close_questions_sheet()
+        self.questions_sheet = make_questions_sheet(self, state)
+        vd.push(self.questions_sheet)
+
+    def _close_questions_sheet(self) -> None:
+        if self.questions_sheet is not None:
+            from visidata import vd
+            if self.questions_sheet in vd.sheets:
+                vd.remove(self.questions_sheet)
+            self.questions_sheet = None
 
     def _completion_items(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         prefix = str(payload.get("prefix", ""))
         cursor = int(payload.get("cursor_pos", len(prefix)))
+        state = self._answer_state
+        if state is not None:
+            choices = [(str(option.get("label", "")), str(option.get("description", "")))
+                       for option in state["options"]]
+            choices.append(("/cancel", "Cancel the waiting turn"))
+            return [{"text": label, "label": label, "detail": detail, "kind": "text",
+                     "start": 0, "end": cursor}
+                    for label, detail in choices if label and label.casefold().startswith(prefix.casefold())]
         start = prefix.rfind("/")
         if start < 0 or (start > 0 and not prefix[start - 1].isspace()):
             return []
@@ -630,6 +806,11 @@ class ACPApplication:
             vd.push(make_diffs_sheet(self, diffs))
         elif diffs:
             self.open_diff(diffs[0])
+        else:
+            from visidata import vd, TextSheet
+            detail = (str(row.get("text", "")) if row.get("group") in {"assistant", "thought"}
+                      else json.dumps(row.get("raw", row), ensure_ascii=False, indent=2))
+            vd.push(TextSheet(str(row.get("title", "ACP event")), source=detail.splitlines()))
 
     def open_diff(self, diff: dict[str, Any]) -> None:
         path = Path(str(diff.get("path", "change.txt")))
@@ -647,6 +828,34 @@ class ACPApplication:
             )
 
         vd.execAsync(deliver, sheet=None)
+
+
+class QuestionPermissionResponse(RequestPermissionResponse):
+    # Qwen/GigaCode's permission extension, also used by its official IDE client.
+    answers: dict[str, str]
+
+
+def _agent_environment() -> dict[str, str]:
+    # The SDK otherwise drops desktop/session variables needed by browser auth.
+    keys = ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CURRENT_DESKTOP", "XAUTHORITY", "BROWSER", "TMPDIR")
+    return {key: os.environ[key] for key in keys if key in os.environ}
+
+
+class _ApplicationLogHandler(logging.Handler):
+    """The SDK uses the root logger, not the asyncio exception handler."""
+
+    def __init__(self, runtime: ACPApplication) -> None:
+        super().__init__()
+        self.runtime = runtime
+
+    def emit(self, record: logging.LogRecord) -> None:
+        detail = self.format(record)
+        self.runtime.store.add_status("ACP diagnostic", detail, record.levelname.lower())
+        self.runtime._refresh()
+        if record.levelno >= logging.ERROR:
+            error = record.exc_info[1] if record.exc_info else RuntimeError(record.getMessage())
+            queue_action(lambda: _raise_exception(error))
 
 
 def _resolve_future(future: asyncio.Future[Any], value: Any) -> None:
@@ -693,11 +902,15 @@ def run_application(payload_path: Path, socket_path: str) -> int:
     runtime.live_sheet = make_events_sheet(runtime, [], name=f"acp:{runtime.alias}:session")
     runtime.live_sheet.jusi_acp_raw = True
     runtime.sheet = runtime.live_sheet
-    vd.queueCommand("jusi-acp-start-runtime", sheet=runtime.live_sheet)
+    queue_action(runtime.start)
+    root_logger = logging.getLogger()
+    previous_handlers = root_logger.handlers[:]
+    root_logger.handlers = [_ApplicationLogHandler(runtime)]
     try:
         vd.run(runtime.turns_sheet, runtime.live_sheet)
     finally:
         runtime.close()
+        root_logger.handlers = previous_handlers
     return 0
 
 

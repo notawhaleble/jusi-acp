@@ -16,6 +16,14 @@ import pytest
 from test_application import _payload
 
 
+def test_diff_commands_are_available_on_event_and_turn_sheets(tmp_path):
+    from jusi_acp.application import ACPApplication
+    from jusi_acp.ui import make_events_sheet, make_turns_sheet
+    runtime = ACPApplication(_payload(tmp_path))
+    assert make_events_sheet(runtime).getCommand("d").longname == "jusi-acp-event-diffs"
+    assert make_turns_sheet(runtime).getCommand("d").longname == "jusi-acp-turn-diffs"
+
+
 @pytest.mark.parametrize("body", ["ui-idle", "/sessions"])
 def test_neovim_idle_redraw_and_sdk_diagnostic_stays_in_table(tmp_path, request, body):
     nvim = shutil.which("nvim")

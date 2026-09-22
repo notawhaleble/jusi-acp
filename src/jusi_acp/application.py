@@ -1004,6 +1004,29 @@ class ACPApplication:
                       else json.dumps(row.get("raw", row), ensure_ascii=False, indent=2))
             vd.push(TextSheet(str(row.get("title", "ACP event")), source=detail.splitlines()))
 
+    def open_event_diffs(self, row: dict[str, Any] | None) -> None:
+        self._open_diffs(
+            list((row or {}).get("diffs", [])), "ACP event changes",
+            "Agent supplied no diffs for this event.",
+        )
+
+    def open_turn_diffs(self, row: dict[str, Any] | None) -> None:
+        turn_number = int((row or {}).get("turn", 0))
+        self._open_diffs(
+            self.store.turn_diffs_snapshot(turn_number),
+            f"ACP turn {turn_number} changes",
+            "Agent supplied no diffs for this turn.",
+        )
+
+    def _open_diffs(self, diffs: list[dict[str, Any]], name: str, empty_message: str) -> None:
+        from visidata import TextSheet, vd
+        if not diffs:
+            vd.push(TextSheet(name, source=[empty_message]))
+        elif len(diffs) == 1:
+            self.open_diff(diffs[0])
+        else:
+            vd.push(make_diffs_sheet(self, diffs, name=name))
+
     def open_diff(self, diff: dict[str, Any]) -> None:
         path = Path(str(diff.get("path", "change.txt")))
         from jusi.editor_client import show_diff
@@ -1012,12 +1035,19 @@ class ACPApplication:
         after = str(diff.get("new_text", ""))
 
         def deliver() -> None:
-            show_diff(
-                before, after,
-                before_name=f"{path.name} (before)",
-                after_name=f"{path.name} (after)",
-                filetype=_filetype(path),
-            )
+            try:
+                show_diff(
+                    before, after,
+                    before_name=f"{path.name} (before)",
+                    after_name=f"{path.name} (after)",
+                    filetype=_filetype(path),
+                )
+            except Exception as exc:
+                self.store.add_status(
+                    "Diff delivery failed", f"{type(exc).__name__}: {exc}", "failed"
+                )
+                self._refresh()
+                queue_action(lambda exc=exc: self._show_session_error(f"Diff delivery failed: {exc}"))
 
         vd.execAsync(deliver, sheet=None)
 

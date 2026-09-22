@@ -17,6 +17,7 @@ from acp.schema import (
     PromptResponse,
     SessionCapabilities,
     SessionInfo,
+    ToolCallUpdate,
 )
 
 
@@ -91,6 +92,17 @@ class FakeAgent:
             terminal = await self.client.create_terminal(session_id, "true")
             await self.client.wait_for_terminal_exit(session_id, terminal.terminal_id)
             await self.client.release_terminal(session_id, terminal.terminal_id)
+            return PromptResponse(stop_reason="end_turn")
+        if text == "diff":
+            update = ToolCallUpdate(
+                tool_call_id="edit-1", kind="edit", status="completed", title="Edit example.py",
+                content=[{"type": "diff", "path": "example.py",
+                          "oldText": "before\n", "newText": "after α\n"}],
+            )
+            payload = update.model_dump(mode="json", by_alias=True, exclude_none=True)
+            payload["sessionUpdate"] = "tool_call_update"
+            await self.client.session_update(session_id, payload)
+            await self.client.session_update(session_id, update_agent_message_text("Updated example.py"))
             return PromptResponse(stop_reason="end_turn")
         if text.startswith("questions"):
             self.cancelled.clear()

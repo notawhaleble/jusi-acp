@@ -40,7 +40,9 @@ def test_questions_follow_the_real_jusi_notebook_ux(tmp_path):
     events = [json.loads(line) for path in (tmp_path / "state").rglob("events.jsonl")
               for line in path.read_text().splitlines()]
     prompts = [row["text"] for row in events if row["type"] == "user_prompt"]
-    assert [body.strip() for body in prompts if body.strip() != "fresh-cell-only"] == ["questions-many", "questions", "questions-wait", "healthy"]
+    assert [body.strip() for body in prompts if body.strip() != "fresh-cell-only"] == [
+        "questions-many", "questions", "questions-wait", "healthy", "diff",
+    ]
     assert [body.strip() for body in prompts].count("fresh-cell-only") == 1
     assert result["fresh_isolated"]
     answers = [row["text"] for row in events if row["type"] == "question_answer"]

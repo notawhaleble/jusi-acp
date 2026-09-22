@@ -100,6 +100,10 @@ def make_events_sheet(
         "c", "jusi-acp-cancel", "vd._jusi_acp_runtime.cancel_initial()",
         "cancel active ACP turn",
     )
+    sheet.addCommand(
+        "d", "jusi-acp-event-diffs", "sheet.runtime.open_event_diffs(cursorRow)",
+        "open diffs supplied for this event",
+    )
     sheet.runtime = runtime
     return sheet
 
@@ -126,10 +130,15 @@ def make_turns_sheet(runtime: Any) -> Any:
             ItemColumn("turn", width=8),
             ItemColumn("model", width=24),
             ItemColumn("status", width=14),
+            ItemColumn("changes", width=8),
             ItemColumn("prompt", width=40),
             ItemColumn("reply", width=60),
             ItemColumn("time", width=20),
         ],
+    )
+    sheet.addCommand(
+        "d", "jusi-acp-turn-diffs", "sheet.runtime.open_turn_diffs(cursorRow)",
+        "open files changed during this turn",
     )
     sheet.runtime = runtime
     return sheet
@@ -205,7 +214,9 @@ def make_permission_sheet(runtime: Any, pending: PendingPermission) -> Any:
     return sheet
 
 
-def make_diffs_sheet(runtime: Any, diffs: list[dict[str, Any]]) -> Any:
+def make_diffs_sheet(
+    runtime: Any, diffs: list[dict[str, Any]], *, name: str = "ACP changes"
+) -> Any:
     from visidata import ItemColumn, Sheet
 
     class ACPDiffsSheet(Sheet):  # type: ignore[misc, valid-type]
@@ -216,10 +227,12 @@ def make_diffs_sheet(runtime: Any, diffs: list[dict[str, Any]]) -> Any:
             runtime.open_diff(row)
 
     return ACPDiffsSheet(
-        "ACP changes",
+        name,
         rows=diffs,
         columns=[
             ItemColumn("path", width=60),
+            ItemColumn("change", width=10),
+            ItemColumn("revision", width=9),
             ItemColumn("old_text", width=40),
             ItemColumn("new_text", width=40),
         ],

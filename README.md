@@ -127,8 +127,10 @@ globally.
   sheet with their descriptions and optional free-text input hints. Invoking an
   advertised slash command sends its complete text as a regular ACP prompt;
   command-specific behavior and output remain agent-owned.
-- Diff content opens through Jusi's acknowledged, remote-safe read-only diff
-  action.
+- Press `d` on a tool event to open its ACP-provided diff. Press `d` on a turn
+  to browse all files changed during that turn, then Enter to open one through
+  Jusi's acknowledged, remote-safe read-only Vim diff action. Continuous edits
+  to one path are composed; discontinuous revisions remain separate.
 - ACP remains authoritative for conversation context. The family stores a
   normalized read-only presentation cache so resume-only sessions retain useful
   review history.
@@ -162,8 +164,10 @@ The turns sheet records the model ID reported by the agent, from either model
 configuration or older ACP session model metadata. It stays blank when the
 agent does not report a model; it is not inferred from the executable name.
 Tool events show the tool name/kind, command, and raw input when supplied.
-The reply column contains the final agent message from each turn. Enter opens
-the full event details (or the existing diff view).
+The reply column contains the final agent message from each turn, and `changes`
+counts paths for which the agent supplied ACP diff content. Enter opens the full
+event details. An empty changes view means the agent supplied no diffs; it does
+not prove that no files changed.
 
 Qwen/GigaCode question requests carried in `rawInput.questions` pause the agent
 and show the current question and choices in a read-only view. Type your answer

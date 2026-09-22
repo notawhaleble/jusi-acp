@@ -143,13 +143,27 @@ class EventStore:
 
     def turns_snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [deepcopy({key: value for key, value in turn.items() if key != "events"})
-                    for turn in self.turns]
+            snapshots = []
+            for turn in self.turns:
+                snapshot = deepcopy({
+                    key: value for key, value in turn.items()
+                    if key not in {"events", "raw_events"}
+                })
+                snapshot["changes"] = len({
+                    diff["path"] for diff in _aggregate_diffs(turn.get("raw_events", []))
+                })
+                snapshots.append(snapshot)
+            return snapshots
 
     def turn_events_snapshot(self, turn_number: int) -> list[dict[str, Any]]:
         with self._lock:
             turn = next((item for item in self.turns if item.get("turn") == turn_number), None)
             return deepcopy(turn.get("events", [])) if turn is not None else []
+
+    def turn_diffs_snapshot(self, turn_number: int) -> list[dict[str, Any]]:
+        with self._lock:
+            turn = next((item for item in self.turns if item.get("turn") == turn_number), None)
+            return deepcopy(_aggregate_diffs(turn.get("raw_events", []))) if turn is not None else []
 
     def finish_replay(self) -> None:
         """Close the final history turn after session/load finishes replaying it."""
@@ -176,6 +190,7 @@ class EventStore:
         if kind == "user_message_chunk" and self._active_turn is not None:
             events = self._active_turn["events"]
             if events and events[-1].get("group") == "user":
+                self._active_turn["raw_events"].append(deepcopy(row))
                 text = str(row.get("text", ""))
                 events[-1]["text"] = str(events[-1].get("text", "")) + text
                 self._active_turn["prompt"] = str(self._active_turn.get("prompt", "")) + text
@@ -192,6 +207,7 @@ class EventStore:
                 "status": "running",
                 "stop_reason": "",
                 "events": [],
+                "raw_events": [deepcopy(row)],
             }
             self.turns.append(turn)
             self._active_turn = turn
@@ -202,6 +218,7 @@ class EventStore:
         turn = self._active_turn
         if turn is None:
             return
+        turn["raw_events"].append(deepcopy(row))
         if kind in {"question_waiting", "questions_resumed"}:
             turn["status"] = row.get("status", "running")
         if kind == "config_option_update":
@@ -295,16 +312,54 @@ def _text(raw: dict[str, Any]) -> str:
     return ""
 
 
-def _diffs(raw: dict[str, Any]) -> list[dict[str, str]]:
-    result: list[dict[str, str]] = []
+def _diffs(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
     for item in raw.get("content", []) if isinstance(raw.get("content"), list) else []:
         if isinstance(item, dict) and item.get("type") == "diff":
             result.append({
                 "path": str(item.get("path", "change.txt")),
                 "old_text": str(item.get("oldText", "") or ""),
                 "new_text": str(item.get("newText", "") or ""),
+                "old_present": "oldText" in item,
+                "new_present": "newText" in item,
             })
     return result
+
+
+def _aggregate_diffs(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aggregated: list[dict[str, Any]] = []
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    seen: set[tuple[Any, ...]] = set()
+    for event in events:
+        for diff in event.get("diffs", []):
+            signature = (
+                diff.get("path", "change.txt"), diff.get("old_text", ""),
+                diff.get("new_text", ""), diff.get("old_present", True),
+                diff.get("new_present", True),
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            path = str(diff.get("path", "change.txt"))
+            revisions = by_path.setdefault(path, [])
+            if (revisions and diff.get("old_present", True)
+                    and revisions[-1].get("new_present", True)
+                    and diff.get("old_text", "") == revisions[-1].get("new_text", "")):
+                revisions[-1]["new_text"] = str(diff.get("new_text", ""))
+                revisions[-1]["new_present"] = bool(diff.get("new_present", True))
+                continue
+            revision = {
+                "path": path,
+                "old_text": str(diff.get("old_text", "")),
+                "new_text": str(diff.get("new_text", "")),
+                "old_present": bool(diff.get("old_present", True)),
+                "new_present": bool(diff.get("new_present", True)),
+                "change": "new" if not diff.get("old_present", True) else "modified",
+                "revision": len(revisions) + 1,
+            }
+            revisions.append(revision)
+            aggregated.append(revision)
+    return aggregated
 
 
 def _terminal_id(raw: dict[str, Any]) -> str:

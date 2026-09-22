@@ -17,9 +17,55 @@ def test_diff_content_is_preserved_for_editor_opening(tmp_path: Path, monkeypatc
         ],
     })
     assert row["diffs"] == [
-        {"path": "one.py", "old_text": "old", "new_text": "new"},
-        {"path": "two.py", "old_text": "", "new_text": "created"},
+        {"path": "one.py", "old_text": "old", "new_text": "new",
+         "old_present": True, "new_present": True},
+        {"path": "two.py", "old_text": "", "new_text": "created",
+         "old_present": False, "new_present": True},
     ]
+
+
+def test_turn_diffs_compose_continuous_edits_and_preserve_discontinuous_revisions(tmp_path: Path) -> None:
+    store = EventStore("gigacode", tmp_path)
+    store.add({"kind": "user_prompt", "text": "edit"}, source="user")
+    updates = [
+        {"path": "one.py", "oldText": "a", "newText": "b"},
+        {"path": "one.py", "oldText": "a", "newText": "b"},  # duplicate
+        {"path": "one.py", "oldText": "b", "newText": "c"},
+        {"path": "one.py", "oldText": "unrelated", "newText": "d"},
+        {"path": "new.py", "newText": "created"},
+        {"path": "empty.py", "oldText": "content", "newText": ""},
+    ]
+    for index, diff in enumerate(updates):
+        store.add({"sessionUpdate": "tool_call_update", "toolCallId": f"call-{index}",
+                   "content": [{"type": "diff", **diff}]})
+    store.add({"kind": "turn_stopped", "stopReason": "end_turn"})
+
+    assert store.turns_snapshot()[0]["changes"] == 3
+    diffs = store.turn_diffs_snapshot(1)
+    assert [(diff["path"], diff["old_text"], diff["new_text"], diff["revision"])
+            for diff in diffs] == [
+        ("one.py", "a", "c", 1),
+        ("one.py", "unrelated", "d", 2),
+        ("new.py", "", "created", 1),
+        ("empty.py", "content", "", 1),
+    ]
+    assert diffs[2]["change"] == "new"
+    assert diffs[3]["change"] == "modified"
+
+
+def test_cached_turn_rebuilds_diff_aggregation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    store = EventStore("gigacode", tmp_path)
+    store.bind_session("diff-session", load_cache=False)
+    store.add({"kind": "user_prompt", "text": "edit"}, source="user")
+    store.add({"sessionUpdate": "tool_call_update", "content": [
+        {"type": "diff", "path": "one.py", "oldText": "a", "newText": "b"},
+    ]})
+    store.add({"kind": "turn_stopped", "stopReason": "end_turn"})
+    cached = EventStore("gigacode", tmp_path)
+    cached.bind_session("diff-session", load_cache=True)
+    assert cached.turns_snapshot()[0]["changes"] == 1
+    assert cached.turn_diffs_snapshot(1)[0]["new_text"] == "b"
 
 
 def test_available_commands_are_readable_in_the_event_sheet(tmp_path: Path) -> None:

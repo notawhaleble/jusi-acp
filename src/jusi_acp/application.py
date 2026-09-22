@@ -18,6 +18,7 @@ from acp import PROTOCOL_VERSION, RequestError, spawn_agent_process
 from acp.schema import (
     AuthCapabilities,
     ClientCapabilities,
+    CurrentModeUpdate,
     FileSystemCapabilities,
     Implementation,
     RequestPermissionResponse,
@@ -25,6 +26,7 @@ from acp.schema import (
 )
 
 from . import __version__
+from .compat import MODE_NOTIFICATIONS, install_mode_notifications
 from .ipc import ApplicationController
 from .state import EventStore
 from .questions import QuestionRequest, question_text
@@ -82,6 +84,7 @@ class ACPApplication:
         self.session_id = ""
         self._reported_model = ""
         self.session_modes: Any = None
+        self._current_mode_id = ""
         self.config_options: list[Any] = []
         self.available_commands: list[Any] = []
         self._prompt_lock: asyncio.Lock | None = None
@@ -118,6 +121,7 @@ class ACPApplication:
             self.available_commands = list(getattr(update, "available_commands", []))
         elif kind == "current_mode_update":
             current = getattr(update, "current_mode_id", "")
+            self._current_mode_id = current
             if self.session_modes is not None:
                 self.session_modes.current_mode_id = current
         elif kind == "config_option_update":
@@ -213,7 +217,26 @@ class ACPApplication:
         raise RequestError.method_not_found(f"_{method}")
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
-        _ = method, params
+        if method in MODE_NOTIFICATIONS:
+            await self._mode_notification(params)
+
+    async def _mode_notification(self, params: Any) -> None:
+        if not isinstance(params, dict) or params.get("v", 1) != 1:
+            raise RequestError.invalid_params({"details": "Expected a version 1 mode notification"})
+        session_id = params.get("sessionId")
+        mode_id = params.get("currentModeId")
+        if not isinstance(session_id, str) or not session_id or not isinstance(mode_id, str) or not mode_id:
+            raise RequestError.invalid_params({"details": "Mode notification requires sessionId and currentModeId"})
+        if self.session_id and session_id != self.session_id:
+            return
+        # Qwen often emits this immediately after the standard session update.
+        # Also support the vendor notification alone, without trusting its
+        # legacyFrameSent flag as evidence that we received the standard frame.
+        if mode_id == self._current_mode_id:
+            return
+        await self.session_update(session_id, CurrentModeUpdate(
+            session_update="current_mode_update", current_mode_id=mode_id,
+        ))
 
     def _observe_protocol(self, event: Any) -> None:
         # Older ACP agents return models, which this SDK version discards while
@@ -227,6 +250,7 @@ class ACPApplication:
                 self._reported_model = models["currentModelId"]
 
     def on_connect(self, connection: Any) -> None:
+        install_mode_notifications(connection, self._mode_notification)
         self.connection = connection
 
     # Application lifecycle ---------------------------------------------
@@ -368,6 +392,8 @@ class ACPApplication:
 
     def _capture_session_options(self, response: Any) -> None:
         self.session_modes = getattr(response, "modes", None)
+        if self.session_modes is not None:
+            self._current_mode_id = self.session_modes.current_mode_id
         self.config_options = list(getattr(response, "config_options", None) or [])
 
     async def _close_agent_session(self) -> None:

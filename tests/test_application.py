@@ -484,3 +484,52 @@ def test_finished_turn_cancels_outstanding_question_target(tmp_path, monkeypatch
         assert not app._questions
         assert (await permission_task).outcome.outcome == "cancelled"
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("body", ["mode-notification", "mode-notification-quen", "mode-notification-standalone"])
+def test_vendor_mode_notifications_do_not_raise_or_duplicate(tmp_path, monkeypatch, caplog, body):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        assert app.handle_operation("followup", {"body": body})["stop_reason"] == "end_turn"
+        assert app._current_mode_id == "plan"
+        updates = [row for row in app.store.raw_snapshot() if row["type"] == "current_mode_update"]
+        assert len(updates) == 1
+        assert updates[0]["raw"]["currentModeId"] == "plan"
+        assert not any(record.levelno >= 40 for record in caplog.records)
+        assert app.handle_operation("followup", {"body": "healthy"})["stop_reason"] == "end_turn"
+    finally:
+        app.close()
+
+
+def test_mode_compatibility_preserves_router_errors_and_session_scope(tmp_path, monkeypatch):
+    from acp import RequestError
+    from acp.client.router import build_client_router
+    from jusi_acp.compat import install_mode_notifications
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "current"
+    app.session_modes = SimpleNamespace(current_mode_id="default")
+    router = build_client_router(app)
+    untouched = build_client_router(app)
+    install_mode_notifications(SimpleNamespace(_conn=SimpleNamespace(_handler=router)), app._mode_notification)
+    method = "qwen/notify/session/mode-update"
+    async def run():
+        await router(method, {"sessionId": "other", "currentModeId": "plan"}, True)
+        assert app.session_modes.current_mode_id == "default"
+        await router(method, {"sessionId": "current", "currentModeId": "plan"}, True)
+        assert app.session_modes.current_mode_id == "plan"
+        await router("_" + method, {"sessionId": "current", "currentModeId": "plan"}, True)
+        assert len(app.store.raw_snapshot()) == 1
+        for target, name, params, notification, code in [
+            (router, method, {}, True, -32602),
+            (router, "other/unknown", {}, True, -32601),
+            (router, method, {}, False, -32601),
+            (untouched, method, {}, True, -32601),
+        ]:
+            with pytest.raises(RequestError) as error:
+                await target(name, params, notification)
+            assert error.value.code == code
+    asyncio.run(run())

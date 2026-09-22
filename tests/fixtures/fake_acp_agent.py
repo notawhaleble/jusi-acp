@@ -9,6 +9,7 @@ from acp import PROTOCOL_VERSION, run_agent
 from acp.helpers import update_agent_message_text
 from acp.schema import (
     AgentCapabilities,
+    CurrentModeUpdate,
     Implementation,
     InitializeResponse,
     NewSessionResponse,
@@ -88,6 +89,18 @@ class FakeAgent:
                 await self.client.session_update(session_id, update_agent_message_text("AFTER-ANSWERS"))
                 await self.cancelled.wait()
                 return PromptResponse(stop_reason="cancelled")
+            return PromptResponse(stop_reason="end_turn")
+        if text.startswith("mode-notification"):
+            method = ("quen" if text.endswith("-quen") else "qwen") + "/notify/session/mode-update"
+            if "standalone" not in text:
+                await self.client.session_update(session_id, CurrentModeUpdate(
+                    session_update="current_mode_update", current_mode_id="plan"))
+            await self.client._conn.send_notification(method, {
+                "v": 1, "sessionId": session_id, "currentModeId": "plan", "legacyFrameSent": True,
+            })
+            # A request round-trip orders this test behind notification dispatch.
+            terminal = await self.client.create_terminal(session_id, "true")
+            await self.client.release_terminal(session_id, terminal.terminal_id)
             return PromptResponse(stop_reason="end_turn")
         if text == "ui-idle":
             await asyncio.sleep(2)

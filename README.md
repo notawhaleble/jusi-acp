@@ -46,6 +46,16 @@ Continue after replaying agent history.
 Continue without requesting history replay.
 ```
 
+To browse sessions without putting an ID in the magic header, start a cell with:
+
+```python
+%%acp work
+/sessions
+```
+
+Enter on a session loads its history into the turns sheet. Later Jusi follow-ups
+continue that selected session.
+
 ## Exact provider integration
 
 The exact package advertises the shared claim and wraps its identity around the
@@ -108,7 +118,7 @@ globally.
   advertised in the initial release.
 - Agent-driven authentication is available through `/auth METHOD_ID` or an
   exact provider's configured `AgentLaunch.auth_method`.
-- `/mode ID`, `/config ID VALUE`, and `/cancel` are family commands.
+- `/sessions`, `/mode ID`, `/config ID VALUE`, and `/cancel` are family commands.
 - Initial bodies and later follow-ups use the same family-command dispatcher.
 - ACP `available_commands_update` entries appear in completion and in the event
   sheet with their descriptions and optional free-text input hints. Invoking an
@@ -149,7 +159,8 @@ The turns sheet records the model ID reported by the agent, from either model
 configuration or older ACP session model metadata. It stays blank when the
 agent does not report a model; it is not inferred from the executable name.
 Tool events show the tool name/kind, command, and raw input when supplied.
-Enter opens the full event details (or the existing diff view).
+The reply column contains the final agent message from each turn. Enter opens
+the full event details (or the existing diff view).
 
 Qwen/GigaCode question requests carried in `rawInput.questions` pause the agent
 and show the current question and choices in a read-only view. Type your answer
@@ -180,7 +191,8 @@ exposing the full request payload. Questions use the
 not generic ACP elicitation.
 
 ACP UI updates run from the drawing thread with a bounded curses polling interval,
-including while the terminal has no focus. SDK logging goes to event diagnostics
-and VisiData's Ctrl-E error history. Agent stderr appears as labelled diagnostic
-events, including during authentication. Browser launcher environment variables
-are preserved, and provider environment overrides take precedence.
+including while the terminal has no focus. Recoverable SDK protocol errors stay
+in event diagnostics; runtime failures use VisiData's Ctrl-E error history. Agent
+stderr appears as labelled diagnostic events, including during authentication.
+Browser launcher environment variables are preserved, and provider environment
+overrides take precedence.

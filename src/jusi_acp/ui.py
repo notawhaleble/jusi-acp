@@ -125,6 +125,30 @@ def make_turns_sheet(runtime: Any) -> Any:
     return sheet
 
 
+def make_sessions_sheet(runtime: Any, rows: list[dict[str, Any]]) -> Any:
+    from visidata import ItemColumn, Sheet
+
+    class ACPSessionsSheet(Sheet):  # type: ignore[misc, valid-type]
+        rowtype = "ACP session"
+
+        def openRow(self, row: dict[str, Any], rowidx: int | None = None) -> None:  # type: ignore[override]
+            _ = rowidx
+            runtime.select_session(str(row["session_id"]))
+
+    sheet = ACPSessionsSheet(
+        f"acp_sessions:{runtime.alias}",
+        rows=rows,
+        columns=[
+            ItemColumn("title", width=50),
+            ItemColumn("updated_at", width=24),
+            ItemColumn("cwd", width=60),
+            ItemColumn("session_id", width=40),
+        ],
+    )
+    sheet.runtime = runtime
+    return sheet
+
+
 def make_permission_sheet(runtime: Any, pending: PendingPermission) -> Any:
     from visidata import ItemColumn, Sheet
 

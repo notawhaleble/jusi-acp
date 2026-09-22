@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shlex
 import sys
 import threading
@@ -38,6 +39,7 @@ from .ui import (
     make_events_sheet,
     make_permission_sheet,
     make_questions_sheet,
+    make_sessions_sheet,
     make_turns_sheet,
     queue_action,
 )
@@ -82,6 +84,7 @@ class ACPApplication:
         self.connection: Any = None
         self.initialize_response: Any = None
         self.session_id = ""
+        self._browse_sessions = False
         self._reported_model = ""
         self.session_modes: Any = None
         self._current_mode_id = ""
@@ -93,6 +96,7 @@ class ACPApplication:
         self._question_changed = asyncio.Event()
         self._answer_state: dict[str, Any] | None = None
         self.questions_sheet: Any = None
+        self.sessions_sheet: Any = None
         self._shutdown: asyncio.Event | None = None
         self._connected = threading.Event()
         self._failed: BaseException | None = None
@@ -308,16 +312,24 @@ class ACPApplication:
                     self.store.add_status("Authentication methods", "; ".join(auth_names))
                 if self.auth_method:
                     await self._authenticate(self.auth_method)
-                try:
-                    await self._establish_session()
-                except RequestError as exc:
-                    if not initialized.auth_methods:
-                        raise
-                    self.store.add_status(
-                        "Authentication required", f"{exc}; use /auth METHOD_ID", "blocked"
-                    )
+                browse_sessions = _normalize_followup_body(self.initial_body).strip() == "/sessions"
+                self._browse_sessions = browse_sessions
+                if browse_sessions:
+                    try:
+                        await self._list_sessions()
+                    except (RequestError, ValueError) as exc:
+                        self.store.add_status("Session listing failed", str(exc), "failed")
+                else:
+                    try:
+                        await self._establish_session()
+                    except RequestError as exc:
+                        if not initialized.auth_methods:
+                            raise
+                        self.store.add_status(
+                            "Authentication required", f"{exc}; use /auth METHOD_ID", "blocked"
+                        )
                 self._connected.set()
-                if self.initial_body.strip():
+                if self.initial_body.strip() and not browse_sessions:
                     try:
                         await self._prompt_or_command(self.initial_body, initial=True)
                     except InterruptedError:
@@ -369,6 +381,7 @@ class ACPApplication:
                 cwd=str(self.cwd), session_id=self.requested_session_id,
                 additional_directories=additional, mcp_servers=self.mcp_servers,
             )
+            self.store.finish_replay()
             self._capture_session_options(response)
         elif self.session_action == "resume":
             if session_caps is None or session_caps.resume is None:
@@ -389,6 +402,62 @@ class ACPApplication:
             self._capture_session_options(response)
         self.store.add_status("ACP session ready", self.session_id, "ready")
         self._refresh()
+
+    async def _list_sessions(self) -> list[dict[str, Any]]:
+        assert self.connection is not None
+        caps = self.initialize_response.agent_capabilities
+        session_caps = caps.session_capabilities if caps else None
+        if session_caps is None or session_caps.list is None:
+            raise ValueError("ACP agent does not support session/list")
+        rows: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            response = await self.connection.list_sessions(cwd=str(self.cwd), cursor=cursor)
+            rows.extend({
+                "session_id": item.session_id,
+                "title": item.title or item.session_id,
+                "cwd": item.cwd,
+                "updated_at": item.updated_at or "",
+            } for item in response.sessions)
+            cursor = response.next_cursor
+            if not cursor:
+                break
+        queue_action(lambda rows=rows: self._push_sessions(rows))
+        return rows
+
+    async def _select_session(self, session_id: str) -> None:
+        if self._turn_task is not None and not self._turn_task.done():
+            raise ValueError("Cannot switch sessions while an ACP turn is running")
+        if self.session_id and self.session_id != session_id:
+            await self._close_agent_session()
+        self.requested_session_id = session_id
+        caps = self.initialize_response.agent_capabilities
+        if caps and caps.load_session:
+            self.session_action = "load"
+        else:
+            session_caps = caps.session_capabilities if caps else None
+            if session_caps is None or session_caps.resume is None:
+                raise ValueError("ACP agent cannot load or resume the selected session")
+            self.session_action = "resume"
+        await self._establish_session()
+        self._browse_sessions = False
+        queue_action(self._focus_turns_sheet)
+
+    def select_session(self, session_id: str) -> None:
+        if self.loop is None or self.loop.is_closed():
+            return
+        future = asyncio.run_coroutine_threadsafe(self._select_session(session_id), self.loop)
+
+        def finished(result: ConcurrentFuture[Any]) -> None:
+            error = result.exception()
+            if error is None:
+                return
+            self.store.add_status(
+                "Session selection failed", f"{type(error).__name__}: {error}", "failed"
+            )
+            self._refresh()
+
+        future.add_done_callback(finished)
 
     def _capture_session_options(self, response: Any) -> None:
         self.session_modes = getattr(response, "modes", None)
@@ -422,7 +491,7 @@ class ACPApplication:
             return {"items": self._completion_items(payload)}
         if operation != "followup":
             raise ValueError(f"Unsupported ACP application operation: {operation}")
-        body = str(payload.get("body", ""))
+        body = _normalize_followup_body(str(payload.get("body", "")))
         with self._operation_lock:
             if self._operation_cancel is None:
                 self._operation_cancel = threading.Event()
@@ -464,6 +533,12 @@ class ACPApplication:
             return {"command": "cancel"}
         if self._answer_state is not None:
             return await self._answer_question(body)
+        if stripped == "/sessions":
+            if self._turn_task is not None and not self._turn_task.done():
+                raise ValueError("Cannot list sessions while an ACP turn is running")
+            self._browse_sessions = True
+            rows = await self._list_sessions()
+            return {"command": "sessions", "count": len(rows)}
         if self._turn_task is not None and not self._turn_task.done():
             raise ValueError("The ACP turn is still running; wait for a question or turn completion")
         if stripped.startswith("/mode "):
@@ -493,7 +568,10 @@ class ACPApplication:
                 raise ValueError("usage: /auth METHOD_ID")
             await self._authenticate(parts[1])
             if not self.session_id:
-                await self._establish_session()
+                if self._browse_sessions:
+                    await self._list_sessions()
+                else:
+                    await self._establish_session()
             return {"command": "auth", "method_id": parts[1]}
         if not initial:
             self._cancel_requested.clear()
@@ -683,6 +761,11 @@ class ACPApplication:
         from visidata import vd
         vd.push(make_permission_sheet(self, pending))
 
+    def _push_sessions(self, rows: list[dict[str, Any]]) -> None:
+        from visidata import vd
+        self.sessions_sheet = make_sessions_sheet(self, rows)
+        vd.push(self.sessions_sheet)
+
     def _show_question(self, state: dict[str, Any]) -> None:
         if state is not self._answer_state:
             return
@@ -714,6 +797,11 @@ class ACPApplication:
             return []
         typed = prefix[start + 1:]
         commands = [("cancel", "Cancel the active ACP turn")]
+        if self.initialize_response is not None:
+            caps = getattr(self.initialize_response, "agent_capabilities", None)
+            session_caps = caps.session_capabilities if caps else None
+            if session_caps is not None and session_caps.list is not None:
+                commands.append(("sessions", "Browse and continue an ACP session"))
         if self.session_modes is not None:
             commands.append(("mode", "Set the ACP session mode"))
         if self.config_options:
@@ -879,9 +967,17 @@ class _ApplicationLogHandler(logging.Handler):
         detail = self.format(record)
         self.runtime.store.add_status("ACP diagnostic", detail, record.levelname.lower())
         self.runtime._refresh()
-        if record.levelno >= logging.ERROR:
-            error = record.exc_info[1] if record.exc_info else RuntimeError(record.getMessage())
-            queue_action(lambda: _raise_exception(error))
+
+
+_ACP_HEADER = re.compile(r"^[ \t]*%%acp(?:[ \t].*)?$")
+
+
+def _normalize_followup_body(body: str) -> str:
+    """Remove Jusi's editable cell-magic header from a follow-up body."""
+    lines = body.splitlines(keepends=True)
+    if lines and _ACP_HEADER.match(lines[0].rstrip("\r\n")):
+        return "".join(lines[1:])
+    return body
 
 
 def _resolve_future(future: asyncio.Future[Any], value: Any) -> None:

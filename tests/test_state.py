@@ -87,6 +87,43 @@ def test_cached_raw_journal_rebuilds_turn_summaries(tmp_path: Path, monkeypatch)
     assert all(row["cached"] is True for row in resumed.rows)
 
 
+def test_binding_a_new_session_clears_the_previous_projection(tmp_path: Path) -> None:
+    store = EventStore("gigacode", tmp_path)
+    store.bind_session("old", load_cache=False)
+    store.add({"kind": "user_prompt", "text": "old prompt"}, source="user")
+    store.bind_session("new", load_cache=False)
+    assert store.rows == []
+    assert store.turns == []
+    assert store.active_turn is None
+
+    store.add({"kind": "user_prompt", "text": "new prompt"}, source="user")
+    store.bind_session("new", load_cache=False)
+    assert store.rows == []
+    assert store.turns == []
+
+
+def test_turn_reply_is_only_the_last_agent_message(tmp_path: Path) -> None:
+    store = EventStore("gigacode", tmp_path)
+    store.add({"kind": "user_prompt", "text": "work"}, source="user")
+    store.add({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "first"}})
+    store.add({"sessionUpdate": "tool_call", "toolCallId": "one", "title": "Run"})
+    store.add({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "final"}})
+    assert store.turns_snapshot()[0]["reply"] == "final"
+
+
+def test_loaded_user_chunks_rebuild_turns_and_close_replay(tmp_path: Path) -> None:
+    store = EventStore("gigacode", tmp_path)
+    store.bind_session("loaded", load_cache=False)
+    store.add({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "old "}})
+    store.add({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "prompt"}})
+    store.add({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "answer"}})
+    store.finish_replay()
+    assert store.turns_snapshot()[0]["prompt"] == "old prompt"
+    assert store.turns_snapshot()[0]["reply"] == "answer"
+    assert store.turns_snapshot()[0]["status"] == "loaded"
+    assert store.active_turn is None
+
+
 def test_tool_input_and_command_survive_partial_updates(tmp_path):
     store = EventStore("fixture", tmp_path)
     store.add({"kind": "user_prompt", "text": "inspect"})

@@ -16,7 +16,7 @@ import pytest
 from test_application import _payload
 
 
-def test_neovim_idle_redraw_and_sdk_error_history(tmp_path, request):
+def test_neovim_idle_redraw_and_sdk_diagnostic_stays_in_table(tmp_path, request):
     body = "ui-idle"
     nvim = shutil.which("nvim")
     if not nvim:
@@ -61,4 +61,5 @@ vim.cmd("qa!")
     assert screen["stopped"], screen["turn_screen"]
     assert "Traceback (most recent call last)" not in screen["stream_screen"]
     assert "Traceback (most recent call last)" not in screen["turn_screen"]
-    assert screen["error_seen"], screen["error_screen"]
+    assert not screen["error_seen"], screen["error_screen"]
+    assert "Traceback (most recent call last)" not in screen["error_screen"]

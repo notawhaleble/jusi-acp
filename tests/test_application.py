@@ -282,7 +282,7 @@ def test_model_snapshot_is_retained_per_turn(tmp_path, monkeypatch):
     assert [row["model"] for row in app.store.turns_snapshot()] == ["first", "second"]
 
 
-def test_sdk_logging_reaches_error_history_without_stderr(tmp_path, monkeypatch, capsys):
+def test_sdk_logging_stays_in_diagnostics_without_visidata_error(tmp_path, monkeypatch, capsys):
     import logging
     from jusi_acp.application import _ApplicationLogHandler
     from acp import RequestError
@@ -294,6 +294,7 @@ def test_sdk_logging_reaches_error_history_without_stderr(tmp_path, monkeypatch,
     monkeypatch.setattr(vd, "status", lambda *args, **kwargs: None)
     app = ACPApplication(_payload(tmp_path))
     monkeypatch.setattr(app, "_refresh", lambda **kwargs: None)
+    previous_errors = len(vd.lastErrors)
     logger = logging.getLogger("test-acp-routing")
     monkeypatch.setattr(logger, "handlers", [_ApplicationLogHandler(app)])
     monkeypatch.setattr(logger, "propagate", False)
@@ -303,8 +304,47 @@ def test_sdk_logging_reaches_error_history_without_stderr(tmp_path, monkeypatch,
         logger.exception("Unhandled notification method=fixture/unknown")
     drain_actions()
     assert "fixture/unknown" in app.store.rows[-1]["text"]
-    assert "RequestError" in "\n".join(vd.lastErrors[-1])
+    assert len(vd.lastErrors) == previous_errors
     assert capsys.readouterr().err == ""
+
+
+def test_followup_strips_only_the_acp_cell_header(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        result = app.handle_operation("followup", {"body": "%%acp test\nhello"})
+        assert result["stop_reason"] == "end_turn"
+        prompts = [row["text"] for row in app.store.rows if row["type"] == "user_prompt"]
+        assert prompts == ["hello"]
+        result = app.handle_operation("followup", {"body": "keep\n%%acp literal"})
+        assert result["stop_reason"] == "end_turn"
+        prompts = [row["text"] for row in app.store.rows if row["type"] == "user_prompt"]
+        assert prompts[-1] == "keep\n%%acp literal"
+    finally:
+        app.close()
+
+
+def test_sessions_command_lists_then_loads_selected_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: action())
+    monkeypatch.setattr(ACPApplication, "_push_sessions", lambda self, rows: setattr(self, "listed", rows))
+    monkeypatch.setattr(ACPApplication, "_focus_turns_sheet", lambda self: None)
+    app = ACPApplication(_payload(tmp_path, body="/sessions"))
+    app.start()
+    try:
+        assert app._connected.wait(10)
+        assert app.session_id == ""
+        assert app.listed[0]["session_id"] == "old-session"
+        app.select_session("old-session")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and app.session_id != "old-session":
+            time.sleep(0.01)
+        assert app.session_id == "old-session"
+        assert any(row["text"] == "replayed" for row in app.store.rows)
+        assert app.handle_operation("followup", {"body": "continued"})["session_id"] == "old-session"
+    finally:
+        app.close()
 
 
 def test_legacy_model_response_is_preserved_before_sdk_validation(tmp_path):

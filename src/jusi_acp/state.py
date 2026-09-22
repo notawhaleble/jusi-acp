@@ -35,7 +35,13 @@ class EventStore:
     _active_turn: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def bind_session(self, session_id: str, *, load_cache: bool) -> None:
-        self.session_id = session_id
+        with self._lock:
+            rebinding_session = bool(self.session_id)
+            self.session_id = session_id
+            if rebinding_session:
+                self.rows.clear()
+                self.turns.clear()
+                self._active_turn = None
         if not load_cache:
             return
         path = self._events_path()
@@ -144,9 +150,25 @@ class EventStore:
             turn = next((item for item in self.turns if item.get("turn") == turn_number), None)
             return deepcopy(turn.get("events", [])) if turn is not None else []
 
+    def finish_replay(self) -> None:
+        """Close the final history turn after session/load finishes replaying it."""
+        with self._lock:
+            if self._active_turn is not None:
+                self._active_turn["status"] = "loaded"
+                self._active_turn = None
+
     def _project(self, row: dict[str, Any]) -> None:
         kind = str(row.get("type", ""))
-        if kind == "user_prompt":
+        if kind == "user_message_chunk" and self._active_turn is not None:
+            events = self._active_turn["events"]
+            if events and events[-1].get("group") == "user":
+                text = str(row.get("text", ""))
+                events[-1]["text"] = str(events[-1].get("text", "")) + text
+                self._active_turn["prompt"] = str(self._active_turn.get("prompt", "")) + text
+                return
+            self._active_turn["status"] = "loaded"
+            self._active_turn = None
+        if kind in {"user_prompt", "user_message_chunk"}:
             turn = {
                 "turn": len(self.turns) + 1,
                 "time": row.get("time", ""),
@@ -159,7 +181,9 @@ class EventStore:
             }
             self.turns.append(turn)
             self._active_turn = turn
-            turn["events"].append(_presentation_row(row))
+            turn["events"].append(_presentation_row(
+                row, group="user" if kind == "user_message_chunk" else ""
+            ))
             return
         turn = self._active_turn
         if turn is None:
@@ -178,11 +202,12 @@ class EventStore:
             self._active_turn = None
             return
         _merge_presentation_row(turn["events"], row)
-        turn["reply"] = "\n\n".join(
+        replies = [
             str(event.get("text", ""))
             for event in turn["events"]
             if event.get("group") == "assistant"
-        )
+        ]
+        turn["reply"] = replies[-1] if replies else ""
 
     def _events_path(self) -> Path:
         safe_session = hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()[:24]

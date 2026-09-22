@@ -6,15 +6,17 @@ import os
 import sys
 
 from acp import PROTOCOL_VERSION, run_agent
-from acp.helpers import update_agent_message_text
+from acp.helpers import update_agent_message_text, update_user_message_text
 from acp.schema import (
     AgentCapabilities,
     CurrentModeUpdate,
     Implementation,
     InitializeResponse,
+    ListSessionsResponse,
     NewSessionResponse,
     PromptResponse,
     SessionCapabilities,
+    SessionInfo,
 )
 
 
@@ -32,7 +34,9 @@ class FakeAgent:
             protocol_version=min(protocol_version, PROTOCOL_VERSION),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                session_capabilities=SessionCapabilities(resume={}, close={}, additional_directories={}),
+                session_capabilities=SessionCapabilities(
+                    list={}, resume={}, close={}, additional_directories={}
+                ),
             ),
             auth_methods=[{"id": "browser", "name": "Browser"}],
             agent_info=Implementation(name="fake", title="Fake ACP Agent", version="1"),
@@ -48,8 +52,16 @@ class FakeAgent:
         _ = cwd, additional_directories, mcp_servers, kwargs
         return NewSessionResponse(session_id="fake-session")
 
+    async def list_sessions(self, cwd=None, cursor=None, **kwargs):  # type: ignore[no-untyped-def]
+        _ = cursor, kwargs
+        return ListSessionsResponse(sessions=[SessionInfo(
+            session_id="old-session", cwd=cwd or os.getcwd(), title="Previous work",
+            updated_at="2026-09-20T10:00:00Z",
+        )])
+
     async def load_session(self, cwd, session_id, mcp_servers=None, additional_directories=None, **kwargs):  # type: ignore[no-untyped-def]
         _ = cwd, mcp_servers, additional_directories, kwargs
+        await self.client.session_update(session_id, update_user_message_text("old prompt"))
         await self.client.session_update(session_id, update_agent_message_text("replayed"))
         return {}
 

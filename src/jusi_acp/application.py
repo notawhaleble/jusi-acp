@@ -27,7 +27,7 @@ from acp.schema import (
 )
 
 from . import __version__
-from .compat import MODE_NOTIFICATIONS, install_mode_notifications
+from .compat import MODE_NOTIFICATIONS, PROMPT_SUGGESTION_NOTIFICATION, install_mode_notifications
 from .ipc import ApplicationController
 from .state import EventStore
 from .questions import QuestionRequest, question_text
@@ -225,6 +225,22 @@ class ACPApplication:
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         if method in MODE_NOTIFICATIONS:
             await self._mode_notification(params)
+        elif method == PROMPT_SUGGESTION_NOTIFICATION:
+            await self._prompt_suggestion_notification(params)
+
+    async def _prompt_suggestion_notification(self, params: Any) -> None:
+        if not isinstance(params, dict) or params.get("v", 1) != 1:
+            raise RequestError.invalid_params({"details": "Expected a version 1 prompt suggestion"})
+        session_id, suggestion = params.get("sessionId"), params.get("suggestion")
+        if not isinstance(session_id, str) or not session_id or not isinstance(suggestion, str):
+            raise RequestError.invalid_params({"details": "Prompt suggestion requires sessionId and suggestion"})
+        if session_id != self.session_id or not suggestion.strip():
+            return
+        # Advisory only: do not send a prompt, modify editor text, or replace
+        # the final assistant reply. promptId remains available in raw details.
+        self.store.add({"kind": "prompt_suggestion", "title": "Suggested follow-up",
+                        "text": suggestion, "notification": params}, source="agent")
+        self._refresh()
 
     async def _mode_notification(self, params: Any) -> None:
         if not isinstance(params, dict) or params.get("v", 1) != 1:
@@ -261,7 +277,8 @@ class ACPApplication:
                 self._reported_model = models["currentModelId"]
 
     def on_connect(self, connection: Any) -> None:
-        install_mode_notifications(connection, self._mode_notification)
+        install_mode_notifications(connection, self._mode_notification,
+                                   suggestion_handler=self._prompt_suggestion_notification)
         self.connection = connection
 
     # Application lifecycle ---------------------------------------------

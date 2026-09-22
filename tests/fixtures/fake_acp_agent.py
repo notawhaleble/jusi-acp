@@ -79,6 +79,19 @@ class FakeAgent:
     async def prompt(self, session_id, prompt, **kwargs):  # type: ignore[no-untyped-def]
         _ = kwargs
         text = prompt[0].text.strip()
+        if text in {"prompt-suggestion", "prompt-suggestion-prefixed"}:
+            method = "qwen/notify/session/prompt-suggestion"
+            if text.endswith("-prefixed"):
+                method = "_" + method
+            await self.client.session_update(session_id, update_agent_message_text("Finished"))
+            await self.client._conn.send_notification(method, {
+                "v": 1, "sessionId": session_id,
+                "suggestion": "Add tests", "promptId": session_id + "########1",
+            })
+            terminal = await self.client.create_terminal(session_id, "true")
+            await self.client.wait_for_terminal_exit(session_id, terminal.terminal_id)
+            await self.client.release_terminal(session_id, terminal.terminal_id)
+            return PromptResponse(stop_reason="end_turn")
         if text.startswith("questions"):
             self.cancelled.clear()
             questions = [{

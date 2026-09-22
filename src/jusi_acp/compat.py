@@ -11,10 +11,12 @@ MODE_NOTIFICATIONS = frozenset({
     "qwen/notify/session/mode-update",
     "quen/notify/session/mode-update",
 })
+PROMPT_SUGGESTION_NOTIFICATION = "qwen/notify/session/prompt-suggestion"
 
 
 def install_mode_notifications(
-    connection: Any, handler: Callable[[Any], Awaitable[None]]
+    connection: Any, handler: Callable[[Any], Awaitable[None]], *,
+    suggestion_handler: Callable[[Any], Awaitable[None]] | None = None,
 ) -> None:
     # The SDK only forwards underscore-prefixed names to ext_notification.
     # It exposes no registration hook on ClientSideConnection in 0.12, so keep
@@ -25,3 +27,6 @@ def install_mode_notifications(
         raise RuntimeError("Unsupported ACP SDK notification router")
     for method in MODE_NOTIFICATIONS:
         router.add_route(Route(method=method, func=handler, kind="notification"))
+    if suggestion_handler is not None:
+        router.add_route(Route(method=PROMPT_SUGGESTION_NOTIFICATION,
+                               func=suggestion_handler, kind="notification"))

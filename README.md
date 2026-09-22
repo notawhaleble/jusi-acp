@@ -200,6 +200,10 @@ stderr appears as labelled diagnostic events, including during authentication.
 Browser launcher environment variables are preserved, and provider environment
 overrides take precedence.
 
+Qwen's `qwen/notify/session/prompt-suggestion` notification is accepted as an
+advisory `Suggested follow-up` journal event. It never submits a prompt or edits
+the notebook, and does not replace the completed turn's reply.
+
 To collect the last ten saved ACP diagnostics on the target machine, run
 `python -m jusi_acp.diagnostics` using the same Python environment as Jusi.
 It prints package versions and diagnostic messages, including the method and

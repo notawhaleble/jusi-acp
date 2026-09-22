@@ -643,3 +643,53 @@ def test_mode_compatibility_preserves_router_errors_and_session_scope(tmp_path, 
                 await target(name, params, notification)
             assert error.value.code == code
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("body", ["prompt-suggestion", "prompt-suggestion-prefixed"])
+def test_prompt_suggestion_is_advisory_and_does_not_log_errors(tmp_path, monkeypatch, caplog, body):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        assert app.handle_operation("followup", {"body": body})["stop_reason"] == "end_turn"
+        suggestions = [row for row in app.store.raw_snapshot() if row["type"] == "prompt_suggestion"]
+        assert len(suggestions) == 1
+        assert suggestions[0]["text"] == "Add tests"
+        assert app.store.turns_snapshot()[0]["reply"] == "Finished"
+        assert not any(record.levelno >= 40 for record in caplog.records)
+        assert app.handle_operation("followup", {"body": "healthy"})["stop_reason"] == "end_turn"
+        assert [turn["prompt"] for turn in app.store.turns_snapshot()] == [body, "healthy"]
+    finally:
+        app.close()
+
+
+def test_prompt_suggestion_router_scope_and_late_delivery(tmp_path, monkeypatch):
+    from acp import RequestError
+    from acp.client.router import build_client_router
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "current"
+    router = build_client_router(app)
+    app.on_connect(SimpleNamespace(_conn=SimpleNamespace(_handler=router)))
+    method = "qwen/notify/session/prompt-suggestion"
+
+    async def run():
+        app.store.add({"kind": "user_prompt", "text": "work"})
+        app.store.add({"kind": "turn_stopped", "stopReason": "end_turn"})
+        await router(method, {"sessionId": "other", "suggestion": "Ignore"}, True)
+        assert not any(row["type"] == "prompt_suggestion" for row in app.store.rows)
+        await router(method, {"v": 1, "sessionId": "current", "suggestion": "Add tests"}, True)
+        assert app.store.rows[-1]["type"] == "prompt_suggestion"
+        assert app.store.active_turn is None
+        assert app.store.turns_snapshot()[0]["status"] == "end_turn"
+        for name, params, notification, code in [
+            (method, {}, True, -32602),
+            (method, {"v": 2}, True, -32602),
+            (method, {}, False, -32601),
+            ("other/unknown", {}, True, -32601),
+        ]:
+            with pytest.raises(RequestError) as error:
+                await router(name, params, notification)
+            assert error.value.code == code
+    asyncio.run(run())

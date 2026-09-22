@@ -298,12 +298,16 @@ def test_sdk_logging_stays_in_diagnostics_without_visidata_error(tmp_path, monke
     logger = logging.getLogger("test-acp-routing")
     monkeypatch.setattr(logger, "handlers", [_ApplicationLogHandler(app)])
     monkeypatch.setattr(logger, "propagate", False)
+    app._observe_protocol(SimpleNamespace(direction="incoming", message={
+        "method": "fixture/unknown", "params": {"currentModeId": "plan"},
+    }))
     try:
         raise RequestError.method_not_found("fixture/unknown")
     except RequestError:
         logger.exception("Unhandled notification method=fixture/unknown")
     drain_actions()
     assert "fixture/unknown" in app.store.rows[-1]["text"]
+    assert '"currentModeId": "plan"' in app.store.rows[-1]["text"]
     assert len(vd.lastErrors) == previous_errors
     assert capsys.readouterr().err == ""
 
@@ -338,13 +342,79 @@ def test_sessions_command_lists_then_loads_selected_session(tmp_path, monkeypatc
         assert app.listed[0]["session_id"] == "old-session"
         app.select_session("old-session")
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and app.session_id != "old-session":
+        while time.monotonic() < deadline and (app.session_id != "old-session" or app._session_loading):
             time.sleep(0.01)
         assert app.session_id == "old-session"
         assert any(row["text"] == "replayed" for row in app.store.rows)
         assert app.handle_operation("followup", {"body": "continued"})["session_id"] == "old-session"
     finally:
         app.close()
+
+
+def test_session_load_is_exclusive_and_rolls_back_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "working"
+    app.store.bind_session("working", load_cache=False)
+    app.store.add({"kind": "user_prompt", "text": "preserve me"})
+    original = app.store
+    app.initialize_response = SimpleNamespace(agent_capabilities=SimpleNamespace(
+        load_session=True, session_capabilities=SimpleNamespace(additional_directories=None, close={})
+    ))
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        closed = []
+        class Connection:
+            async def load_session(self, **kwargs):
+                entered.set()
+                await release.wait()
+                raise ValueError("fixture load failed")
+            async def close_session(self, session_id):
+                closed.append(session_id)
+        app.connection = Connection()
+        task = asyncio.create_task(app._select_session("broken"))
+        await entered.wait()
+        with pytest.raises(ValueError, match="loading"):
+            await app._prompt_or_command("must not send")
+        with pytest.raises(ValueError, match="loading"):
+            await app._select_session("another")
+        release.set()
+        with pytest.raises(ValueError, match="fixture load failed"):
+            await task
+        assert not closed
+        assert app.session_id == "working"
+        assert app.store is original
+        assert app.store.turns_snapshot()[0]["prompt"] == "preserve me"
+        assert not app._session_loading
+    asyncio.run(run())
+
+
+def test_repeated_load_and_fresh_client_do_not_reuse_old_turns(tmp_path, monkeypatch):
+    from jusi_acp.state import EventStore
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        app.handle_operation("followup", {"body": "previous session"})
+        app._submit(app._select_session("old-session"))
+        app._submit(app._select_session("old-session"))
+        cached = EventStore("fixture", tmp_path)
+        cached.bind_session("old-session", load_cache=True)
+        assert len(cached.turns_snapshot()) == 1
+        assert cached.turns_snapshot()[0]["status"] == "loaded"
+        assert cached.active_turn is None
+    finally:
+        app.close()
+    fresh = ACPApplication(_payload(tmp_path))
+    fresh.start()
+    try:
+        fresh.handle_operation("followup", {"body": "fresh prompt"})
+        assert [row["prompt"] for row in fresh.store.turns_snapshot()] == ["fresh prompt"]
+    finally:
+        fresh.close()
 
 
 def test_legacy_model_response_is_preserved_before_sdk_validation(tmp_path):

@@ -39,12 +39,22 @@ def install_api() -> None:
     # Keep curses polling; ungetch from another thread cannot wake a blocked read.
     vd.timeouts_before_idle = -1
     original_draw = vd.draw_all
+    original_getkeystroke = vd.getkeystroke
 
     def draw_all() -> None:
         drain_actions()
         original_draw()
 
     vd.draw_all = draw_all
+
+    def getkeystroke(scr: Any, sheet: Any) -> Any:
+        # mainloop captures its sheet before draw_all. A queued push during
+        # drawing must not route the first key to the previously visible sheet.
+        if sheet is not vd.activeSheet:
+            return ""
+        return original_getkeystroke(scr, sheet)
+
+    vd.getkeystroke = getkeystroke
     _INSTALLED = True
 
 

@@ -16,8 +16,8 @@ import pytest
 from test_application import _payload
 
 
-def test_neovim_idle_redraw_and_sdk_diagnostic_stays_in_table(tmp_path, request):
-    body = "ui-idle"
+@pytest.mark.parametrize("body", ["ui-idle", "/sessions"])
+def test_neovim_idle_redraw_and_sdk_diagnostic_stays_in_table(tmp_path, request, body):
     nvim = shutil.which("nvim")
     if not nvim:
         pytest.skip("Neovim is required for terminal integration")
@@ -40,9 +40,13 @@ local job = vim.fn.termopen(COMMAND)
 local function screen()
   return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\\n")
 end
-local streamed = vim.wait(10000, function() return screen():find("AUTOMATIC%-STREAM") ~= nil end, 50)
+if BROWSE then
+  assert(vim.wait(10000, function() return screen():find("Previous work", 1, true) ~= nil end, 50))
+  vim.fn.chansend(job, string.char(13))
+end
+local streamed = vim.wait(10000, function() return screen():find(BROWSE and "old prompt" or "AUTOMATIC%-STREAM") ~= nil end, 50)
 local stream_screen = screen()
-local stopped = vim.wait(10000, function() return screen():find("end_turn") ~= nil end, 50)
+local stopped = vim.wait(10000, function() return screen():find(BROWSE and "loaded" or "end_turn") ~= nil end, 50)
 local turn_screen = screen()
 pcall(vim.fn.chansend, job, string.char(5))
 local error_seen = vim.wait(5000, function() return screen():find("RequestError") ~= nil end, 50)
@@ -50,7 +54,7 @@ vim.fn.writefile({vim.json.encode({streamed=streamed, stopped=stopped, error_see
     stream_screen=stream_screen, turn_screen=turn_screen, error_screen=screen()})}, RESULT)
 vim.fn.jobstop(job)
 vim.cmd("qa!")
-'''.replace("COMMAND", lua_command).replace("RESULT", json.dumps(str(result_path))))
+'''.replace("COMMAND", lua_command).replace("RESULT", json.dumps(str(result_path))).replace("BROWSE", "true" if body == "/sessions" else "false"))
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
                JUSI_STATE_HOME=str(tmp_path / "state"), TERM="xterm-256color")
     result = subprocess.run([nvim, "--headless", "-u", "NONE", "-l", str(script)],

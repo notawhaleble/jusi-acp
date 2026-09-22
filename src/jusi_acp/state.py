@@ -33,6 +33,7 @@ class EventStore:
     turns: list[dict[str, Any]] = field(default_factory=list)
     _lock: Lock = field(default_factory=Lock, repr=False)
     _active_turn: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    persist: bool = field(default=True, repr=False)
 
     def bind_session(self, session_id: str, *, load_cache: bool) -> None:
         with self._lock:
@@ -152,10 +153,23 @@ class EventStore:
 
     def finish_replay(self) -> None:
         """Close the final history turn after session/load finishes replaying it."""
-        with self._lock:
-            if self._active_turn is not None:
-                self._active_turn["status"] = "loaded"
-                self._active_turn = None
+        if self.active_turn is not None:
+            self.add({"kind": "turn_stopped", "stopReason": "loaded"}, source="client")
+
+    def commit_replay(self) -> None:
+        """Replace the presentation cache only after a successful agent replay."""
+        import tempfile
+        path = self._events_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(dir=path.parent, prefix="events-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                for row in self.raw_snapshot():
+                    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            os.replace(name, path)
+        finally:
+            Path(name).unlink(missing_ok=True)
+        self.persist = True
 
     def _project(self, row: dict[str, Any]) -> None:
         kind = str(row.get("type", ""))
@@ -214,7 +228,7 @@ class EventStore:
         return state_root(self.provider, self.cwd) / "sessions" / safe_session / "events.jsonl"
 
     def _append(self, row: dict[str, Any]) -> None:
-        if not self.session_id:
+        if not self.session_id or not self.persist:
             return
         path = self._events_path()
         path.parent.mkdir(parents=True, exist_ok=True)

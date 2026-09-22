@@ -33,7 +33,9 @@ local ok, failure = xpcall(function()
     local cell = session.model:cell_by_id(surface.client.cell_id)
     local snapshot = session.model:cell_snapshot(cell)
     local first = snapshot.body_start_row
-    vim.api.nvim_buf_set_lines(buf, first, snapshot.body_end_row, false, lines)
+    local body = {"%%acp fixture"}
+    vim.list_extend(body, lines)
+    vim.api.nvim_buf_set_lines(buf, first, snapshot.body_end_row, false, body)
   end
   local function followup(lines)
     edit_body(lines)
@@ -72,6 +74,24 @@ local ok, failure = xpcall(function()
   for _, entry in ipairs(snapshot.history_entries) do
     table.insert(result.history, table.concat(vim.api.nvim_buf_get_lines(buf, entry.start_row, entry.end_row, false), "\n"))
   end
+  local next_row = vim.api.nvim_buf_line_count(buf) + 1
+  vim.api.nvim_buf_set_lines(buf, -1, -1, false, {"╭──", "%%acp fixture", "fresh-cell-only", "╰──"})
+  jusi.execute(buf, next_row)
+  local fresh
+  wait_for(function()
+    for id, candidate in pairs(session.interactive.surfaces) do
+      if id ~= surface_id then fresh = candidate; return true end
+    end
+  end, "fresh cell did not get a separate terminal")
+  local function fresh_screen()
+    return table.concat(vim.api.nvim_buf_get_lines(fresh.buf, 0, -1, false), "\n")
+  end
+  wait_for(function() return fresh_screen():find("end_turn", 1, true) end, "fresh cell did not finish")
+  assert(fresh.client.client_id ~= client_id, "fresh cell reused previous client")
+  assert(fresh_screen():find("fresh%-cell%-only"), fresh_screen())
+  assert(not fresh_screen():find("questions", 1, true), fresh_screen())
+  assert(not fresh_screen():find("healthy", 1, true), fresh_screen())
+  result.fresh_isolated = true
 end, debug.traceback)
 if jusi._sessions[buf] then
   jusi.stop_service(buf)

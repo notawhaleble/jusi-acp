@@ -50,6 +50,9 @@ class FakeAgent:
 
     async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kwargs):  # type: ignore[no-untyped-def]
         _ = cwd, additional_directories, mcp_servers, kwargs
+        if os.environ.get("JUSI_FIXTURE_UNIQUE_SESSIONS"):
+            from uuid import uuid4
+            return NewSessionResponse(session_id=uuid4().hex)
         return NewSessionResponse(session_id="fake-session")
 
     async def list_sessions(self, cwd=None, cursor=None, **kwargs):  # type: ignore[no-untyped-def]
@@ -112,6 +115,7 @@ class FakeAgent:
             })
             # A request round-trip orders this test behind notification dispatch.
             terminal = await self.client.create_terminal(session_id, "true")
+            await self.client.wait_for_terminal_exit(session_id, terminal.terminal_id)
             await self.client.release_terminal(session_id, terminal.terminal_id)
             return PromptResponse(stop_reason="end_turn")
         if text == "ui-idle":

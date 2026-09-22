@@ -86,6 +86,7 @@ class ACPApplication:
         self.session_id = ""
         self._browse_sessions = False
         self._reported_model = ""
+        self._notification_frames: dict[str, Any] = {}
         self.session_modes: Any = None
         self._current_mode_id = ""
         self.config_options: list[Any] = []
@@ -97,6 +98,7 @@ class ACPApplication:
         self._answer_state: dict[str, Any] | None = None
         self.questions_sheet: Any = None
         self.sessions_sheet: Any = None
+        self._session_loading = False
         self._shutdown: asyncio.Event | None = None
         self._connected = threading.Event()
         self._failed: BaseException | None = None
@@ -247,6 +249,11 @@ class ACPApplication:
         # validating session responses. Preserve the reported ID at the boundary.
         if event.direction != "incoming":
             return
+        method = event.message.get("method")
+        if isinstance(method, str) and "id" not in event.message and method != "session/update":
+            self._notification_frames[method] = event.message.get("params")
+            if len(self._notification_frames) > 32:
+                self._notification_frames.pop(next(iter(self._notification_frames)))
         result = event.message.get("result")
         if isinstance(result, dict):
             models = result.get("models")
@@ -366,6 +373,37 @@ class ACPApplication:
             self.store.add_status("ACP agent stderr", retained.decode("utf-8", errors="replace"), "failed")
 
     async def _establish_session(self) -> None:
+        if self._session_loading:
+            raise ValueError("A session is loading; wait before submitting another operation")
+        self._session_loading = True
+        fields = ("store", "session_id", "session_modes", "_current_mode_id",
+                  "config_options", "available_commands", "_reported_model")
+        previous = {name: getattr(self, name) for name in fields}
+        self.store = EventStore(self.plugin_id, self.cwd, persist=False)
+        if not previous["session_id"]:
+            for row in previous["store"].raw_snapshot():
+                if row["type"] == "status":
+                    self.store.add(row["raw"], source=row["source"])
+        self.session_id = self.requested_session_id if self.session_action != "new" else ""
+        self.session_modes = None
+        self._current_mode_id = ""
+        self.config_options = []
+        self.available_commands = []
+        self._reported_model = ""
+        try:
+            await self._establish_session_inner()
+            self.store.commit_replay()
+            if previous["session_id"] and previous["session_id"] != self.session_id:
+                await self._close_agent_session(previous["session_id"])
+        except BaseException:
+            for name, value in previous.items():
+                setattr(self, name, value)
+            raise
+        finally:
+            self._session_loading = False
+            self._refresh()
+
+    async def _establish_session_inner(self) -> None:
         assert self.connection is not None
         additional = [str(path) for path in self.additional_directories]
         caps = self.initialize_response.agent_capabilities
@@ -426,11 +464,11 @@ class ACPApplication:
         return rows
 
     async def _select_session(self, session_id: str) -> None:
+        if self._session_loading:
+            raise ValueError("A session is loading; wait before selecting another session")
         if self._turn_task is not None and not self._turn_task.done():
             raise ValueError("Cannot switch sessions while an ACP turn is running")
-        if self.session_id and self.session_id != session_id:
-            await self._close_agent_session()
-        self.requested_session_id = session_id
+        old_action, old_requested = self.session_action, self.requested_session_id
         caps = self.initialize_response.agent_capabilities
         if caps and caps.load_session:
             self.session_action = "load"
@@ -439,9 +477,14 @@ class ACPApplication:
             if session_caps is None or session_caps.resume is None:
                 raise ValueError("ACP agent cannot load or resume the selected session")
             self.session_action = "resume"
-        await self._establish_session()
+        self.requested_session_id = session_id
+        try:
+            await self._establish_session()
+        except BaseException:
+            self.session_action, self.requested_session_id = old_action, old_requested
+            raise
         self._browse_sessions = False
-        queue_action(self._focus_turns_sheet)
+        queue_action(self._show_selected_session)
 
     def select_session(self, session_id: str) -> None:
         if self.loop is None or self.loop.is_closed():
@@ -456,8 +499,22 @@ class ACPApplication:
                 "Session selection failed", f"{type(error).__name__}: {error}", "failed"
             )
             self._refresh()
+            queue_action(lambda error=error: self._show_session_error(str(error)))
 
         future.add_done_callback(finished)
+
+    def _show_selected_session(self) -> None:
+        from visidata import vd
+        for sheet in list(vd.sheets):
+            if getattr(sheet, "runtime", None) is self and sheet is not self.turns_sheet:
+                vd.remove(sheet)
+        self.live_sheet = None
+        self.sessions_sheet = None
+        self._focus_turns_sheet()
+
+    def _show_session_error(self, message: str) -> None:
+        from visidata import vd, TextSheet
+        vd.push(TextSheet("Session selection failed", source=message.splitlines()))
 
     def _capture_session_options(self, response: Any) -> None:
         self.session_modes = getattr(response, "modes", None)
@@ -465,14 +522,14 @@ class ACPApplication:
             self._current_mode_id = self.session_modes.current_mode_id
         self.config_options = list(getattr(response, "config_options", None) or [])
 
-    async def _close_agent_session(self) -> None:
+    async def _close_agent_session(self, session_id: str | None = None) -> None:
         if not self.connection or not self.session_id or not self.initialize_response:
             return
         caps = self.initialize_response.agent_capabilities
         session_caps = caps.session_capabilities if caps else None
         if session_caps is not None and session_caps.close is not None:
             try:
-                await self.connection.close_session(self.session_id)
+                await self.connection.close_session(session_id or self.session_id)
             except Exception:
                 pass
 
@@ -518,6 +575,8 @@ class ACPApplication:
         return future.result()
 
     async def _prompt_or_command(self, body: str, *, initial: bool = False) -> dict[str, Any]:
+        if self._session_loading:
+            raise ValueError("A session is loading; wait before submitting a follow-up")
         stripped = body.strip()
         with self._operation_lock:
             cancelled = self._operation_cancel is not None and self._operation_cancel.is_set()
@@ -849,6 +908,8 @@ class ACPApplication:
             self._refresh_dirty = False
             self._refresh_scheduled = False
             self._last_refresh = time.monotonic()
+        if self._session_loading:
+            return
         if self.turns_sheet is not None:
             self.turns_sheet.rows = self.store.turns_snapshot()
             self.turns_sheet.recalc()
@@ -965,6 +1026,11 @@ class _ApplicationLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         detail = self.format(record)
+        match = re.search(r"\bmethod=([^\s]+)", record.getMessage())
+        if match and match[1] in self.runtime._notification_frames:
+            detail += "\nNotification params: " + json.dumps(
+                self.runtime._notification_frames[match[1]], ensure_ascii=False
+            )
         self.runtime.store.add_status("ACP diagnostic", detail, record.levelname.lower())
         self.runtime._refresh()
 

@@ -22,4 +22,5 @@ load_ipython_extension = _adapter.load_ipython_extension
 
 def create_worker(context):
     return ACPWorker(context, ProviderSpec("acp_fixture", "1.0.0", lambda config, cwd:
-        AgentLaunch((sys.executable, str(Path(__file__).with_name("fake_acp_agent.py"))), cwd)))
+        AgentLaunch((sys.executable, str(Path(__file__).with_name("fake_acp_agent.py"))), cwd,
+                    environment={"JUSI_FIXTURE_UNIQUE_SESSIONS": "1"})))

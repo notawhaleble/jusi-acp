@@ -55,6 +55,9 @@ To browse sessions without putting an ID in the magic header, start a cell with:
 
 Enter on a session loads its history into the turns sheet. Later Jusi follow-ups
 continue that selected session.
+While loading, follow-ups and further selections are rejected with a wait message.
+A failed load preserves the previous session and its displayed history.
+The agent must advertise `session/list` and either `session/load` or `session/resume`.
 
 ## Exact provider integration
 
@@ -196,3 +199,9 @@ in event diagnostics; runtime failures use VisiData's Ctrl-E error history. Agen
 stderr appears as labelled diagnostic events, including during authentication.
 Browser launcher environment variables are preserved, and provider environment
 overrides take precedence.
+
+To collect the last ten saved ACP diagnostics on the target machine, run
+`python -m jusi_acp.diagnostics` using the same Python environment as Jusi.
+It prints package versions and diagnostic messages, including the method and
+parameters of a failed notification when captured. Check that output before
+sharing it: agent-supplied notification parameters may contain private data.

@@ -16,6 +16,24 @@ import pytest
 from test_application import _payload
 
 
+def test_getkeystroke_accepts_search_input_without_sheet(monkeypatch):
+    from visidata import vd
+    from jusi_acp import ui
+
+    calls = []
+    screen = object()
+    monkeypatch.setattr(ui, "_INSTALLED", False)
+    monkeypatch.setattr(vd, "draw_all", lambda: None)
+    monkeypatch.setattr(vd, "getkeystroke", lambda scr, sheet=None: calls.append((scr, sheet)) or "x")
+
+    ui.install_api()
+
+    assert vd.getkeystroke(screen) == "x"
+    assert calls == [(screen, None)]
+    assert vd.getkeystroke(screen, object()) == ""
+    assert calls == [(screen, None)]
+
+
 def test_diff_commands_are_available_on_event_and_turn_sheets(tmp_path):
     from jusi_acp.application import ACPApplication
     from jusi_acp.ui import make_events_sheet, make_turns_sheet
@@ -54,7 +72,7 @@ if BROWSE then
 end
 local streamed = vim.wait(10000, function() return screen():find(BROWSE and "old prompt" or "AUTOMATIC%-STREAM") ~= nil end, 50)
 local stream_screen = screen()
-local stopped = vim.wait(10000, function() return screen():find(BROWSE and "loaded" or "end_turn") ~= nil end, 50)
+local stopped = vim.wait(10000, function() return screen():find("ACP turn", 1, true) ~= nil end, 50)
 local turn_screen = screen()
 pcall(vim.fn.chansend, job, string.char(5))
 local error_seen = vim.wait(5000, function() return screen():find("RequestError") ~= nil end, 50)

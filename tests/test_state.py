@@ -5,6 +5,31 @@ from pathlib import Path
 from jusi_acp.state import EventStore
 
 
+def test_latest_context_usage_preserves_cost_and_replays_late_update(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    store = EventStore("fixture", tmp_path)
+    store.bind_session("usage", load_cache=False)
+    store.add({"kind": "user_prompt", "text": "hello"})
+    store.add({"sessionUpdate": "usage_update", "used": 20, "size": 100,
+               "cost": {"amount": 0, "currency": "USD"}})
+    store.add({"sessionUpdate": "usage_update", "used": 10, "size": 100})
+    assert store.turns_snapshot()[0]["context_used"] == 10
+    store.add({"kind": "turn_stopped", "stopReason": "cancelled"})
+    store.add({"sessionUpdate": "usage_update", "used": 0, "size": 100})
+    row = store.turns_snapshot()[0]
+    assert row["status"] == "cancelled"
+    assert row["context_used"] == 0
+    assert row["session_cost"] == 0
+    assert row["currency"] == "USD"
+    assert "total_tokens" not in row
+    cached = EventStore("fixture", tmp_path)
+    cached.bind_session("usage", load_cache=True)
+    assert cached.turns_snapshot() == [row]
+    store.bind_session("other", load_cache=False)
+    store.add({"kind": "user_prompt", "text": "new session"})
+    assert "context_used" not in store.turns_snapshot()[0]
+
+
 def test_diff_content_is_preserved_for_editor_opening(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
     store = EventStore("gigacode", tmp_path)

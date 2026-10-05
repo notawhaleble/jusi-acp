@@ -282,6 +282,39 @@ def test_model_snapshot_is_retained_per_turn(tmp_path, monkeypatch):
     assert [row["model"] for row in app.store.turns_snapshot()] == ["first", "second"]
 
 
+def test_real_acp_usage_response_and_notification_reach_turn_sheet(tmp_path, monkeypatch):
+    from jusi_acp.state import EventStore
+    from jusi_acp.ui import make_turns_sheet
+
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    app = ACPApplication(_payload(tmp_path))
+    app.start()
+    try:
+        assert app._connected.wait(10)
+        app.handle_operation("followup", {"body": "usage"})
+        row = app.store.turns_snapshot()[0]
+        expected = {
+            "total_tokens": 150, "input_tokens": 100, "output_tokens": 25,
+            "thought_tokens": 5, "cached_read_tokens": 20, "cached_write_tokens": 0,
+            "context_used": 120, "context_size": 200000,
+            "session_cost": 0.025, "currency": "USD",
+        }
+        sheet = make_turns_sheet(app)
+        columns = {column.name: column for column in sheet.columns}
+        for key, value in expected.items():
+            assert columns[key].getValue(row) == value
+        assert row["usage"]["_meta"] == {"extra": "preserved"}
+        cached = EventStore(app.store.provider, tmp_path)
+        cached.bind_session(app.session_id, load_cache=True)
+        assert cached.turns_snapshot() == app.store.turns_snapshot()
+        app.handle_operation("followup", {"body": "hello"})
+        missing = app.store.turns_snapshot()[1]
+        assert all(columns[key].getValue(missing) is None for key in expected)
+        assert app.store.turns_snapshot()[0] == row
+    finally:
+        app.close()
+
+
 def test_sdk_logging_stays_in_diagnostics_without_visidata_error(tmp_path, monkeypatch, capsys):
     import logging
     from jusi_acp.application import _ApplicationLogHandler

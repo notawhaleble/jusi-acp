@@ -47,10 +47,10 @@ def install_api() -> None:
 
     vd.draw_all = draw_all
 
-    def getkeystroke(scr: Any, sheet: Any) -> Any:
+    def getkeystroke(scr: Any, sheet: Any = None) -> Any:
         # mainloop captures its sheet before draw_all. A queued push during
         # drawing must not route the first key to the previously visible sheet.
-        if sheet is not vd.activeSheet:
+        if sheet is not None and sheet is not vd.activeSheet:
             return ""
         return original_getkeystroke(scr, sheet)
 
@@ -128,12 +128,22 @@ def make_turns_sheet(runtime: Any) -> Any:
         rows=runtime.store.turns_snapshot(),
         columns=[
             ItemColumn("turn", width=8),
+            ItemColumn("prompt", width=40),
+            ItemColumn("reply", width=60),
             ItemColumn("model", width=24),
             ItemColumn("status", width=14),
             ItemColumn("changes", width=8),
-            ItemColumn("prompt", width=40),
-            ItemColumn("reply", width=60),
             ItemColumn("time", width=20),
+            ItemColumn("total_tokens", width=14, type=int),
+            ItemColumn("context_used", width=14, type=int),
+            ItemColumn("session_cost", width=14, type=float),
+            ItemColumn("currency", width=10),
+            ItemColumn("input_tokens", width=14, type=int),
+            ItemColumn("output_tokens", width=14, type=int),
+            ItemColumn("thought_tokens", width=15, type=int),
+            ItemColumn("cached_read_tokens", width=19, type=int),
+            ItemColumn("cached_write_tokens", width=20, type=int),
+            ItemColumn("context_size", width=14, type=int),
         ],
     )
     sheet.addCommand(

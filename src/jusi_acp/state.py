@@ -216,9 +216,22 @@ class EventStore:
             ))
             return
         turn = self._active_turn
+        # Some agents deliver the final context snapshot after the prompt reply.
+        if turn is None and kind == "usage_update" and self.turns:
+            turn = self.turns[-1]
         if turn is None:
             return
         turn["raw_events"].append(deepcopy(row))
+        raw = row.get("raw", {})
+        if kind == "usage_update":
+            turn["context_usage"] = deepcopy(raw)
+            turn["context_used"] = raw.get("used")
+            turn["context_size"] = raw.get("size")
+            # Cost is optional: retain the latest reported cumulative cost when
+            # a later context-only update omits it.
+            if isinstance(cost := raw.get("cost"), dict):
+                turn["session_cost"] = cost.get("amount")
+                turn["currency"] = cost.get("currency")
         if kind in {"question_waiting", "questions_resumed"}:
             turn["status"] = row.get("status", "running")
         if kind == "config_option_update":
@@ -226,6 +239,18 @@ class EventStore:
                 if option.get("category") == "model" or option.get("id") == "model":
                     turn["model"] = str(option.get("currentValue", ""))
         if kind == "turn_stopped":
+            if isinstance(usage := raw.get("usage"), dict):
+                turn["usage"] = deepcopy(usage)
+                for wire, column in (
+                    ("totalTokens", "total_tokens"),
+                    ("inputTokens", "input_tokens"),
+                    ("outputTokens", "output_tokens"),
+                    ("thoughtTokens", "thought_tokens"),
+                    ("cachedReadTokens", "cached_read_tokens"),
+                    ("cachedWriteTokens", "cached_write_tokens"),
+                ):
+                    if usage.get(wire) is not None:
+                        turn[column] = usage[wire]
             turn["events"].append(_presentation_row(row))
             stop_reason = str(row.get("status", "") or "")
             turn["stop_reason"] = stop_reason

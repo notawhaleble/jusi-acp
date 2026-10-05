@@ -18,6 +18,8 @@ from acp.schema import (
     SessionCapabilities,
     SessionInfo,
     ToolCallUpdate,
+    Usage,
+    UsageUpdate,
 )
 
 
@@ -80,6 +82,16 @@ class FakeAgent:
     async def prompt(self, session_id, prompt, **kwargs):  # type: ignore[no-untyped-def]
         _ = kwargs
         text = prompt[0].text.strip()
+        if text == "usage":
+            await self.client.session_update(session_id, UsageUpdate(
+                session_update="usage_update", used=120, size=200000,
+                cost={"amount": 0.025, "currency": "USD"},
+            ))
+            return PromptResponse(stop_reason="end_turn", usage=Usage(
+                total_tokens=150, input_tokens=100, output_tokens=25,
+                thought_tokens=5, cached_read_tokens=20, cached_write_tokens=0,
+                field_meta={"extra": "preserved"},
+            ))
         if text in {"prompt-suggestion", "prompt-suggestion-prefixed"}:
             method = "qwen/notify/session/prompt-suggestion"
             if text.endswith("-prefixed"):

@@ -1,10 +1,5 @@
 """Provider-facing API for the Jusi ACP plugin family."""
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    __version__ = version("jusi-acp")
-except PackageNotFoundError:  # source checkout
-    __version__ = "0.1.0"
+from ._version import __version__
 
 from .family import (  # noqa: E402
     CAPABILITIES,

@@ -759,7 +759,11 @@ class ACPApplication:
                         _resolve_future(future, None)
                     self._publish_question()
             stop_reason = str(response.stop_reason)
-            self.store.add({"kind": "turn_stopped", "stopReason": stop_reason}, source="agent")
+            stopped: dict[str, Any] = {"kind": "turn_stopped", "stopReason": stop_reason}
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                stopped["usage"] = usage.model_dump(mode="json", by_alias=True, exclude_none=True)
+            self.store.add(stopped, source="agent")
             self._refresh()
             queue_action(self._focus_turns_sheet)
             cancelled = (

@@ -169,6 +169,26 @@ counts paths for which the agent supplied ACP diff content. Enter opens the full
 event details. An empty changes view means the agent supplied no diffs; it does
 not prove that no files changed.
 
+Usage is presented by the ACP family whenever the agent reports it. The turns
+sheet shows `total_tokens`, `input_tokens`, `output_tokens`, `thought_tokens`,
+`cached_read_tokens`, and `cached_write_tokens` from the final prompt response,
+plus the latest `context_used`, `context_size`, cumulative `session_cost`, and
+`currency` from ACP `usage_update` notifications. Zero is displayed as zero;
+unreported values stay blank, and a new turn does not inherit old usage. These
+snapshots survive presentation-cache reloads. Enter on a turn opens its events;
+Enter on a usage or stop event exposes the original payload and metadata.
+Usage columns follow the existing turn review columns; scroll horizontally to
+see the full breakdown.
+
+Context usage is the number of tokens currently in the context window, not
+tokens consumed by a turn. Cost is cumulative for the session. Final response
+token usage is experimental and is displayed exactly as reported: ACP's
+[usage scope ambiguity](https://github.com/agentclientprotocol/agent-client-protocol/issues/1860)
+means agents may report per-turn or cumulative token counts. The family does not
+sum them or infer deltas. Provider-specific usage hidden in extension metadata
+needs an explicit provider mapping; arbitrary metadata is preserved without
+guessing its meaning.
+
 Qwen/GigaCode question requests carried in `rawInput.questions` pause the agent
 and show the current question and choices in a read-only view. Type your answer
 in the notebook cell in Vim and submit it using the usual Jusi follow-up action.

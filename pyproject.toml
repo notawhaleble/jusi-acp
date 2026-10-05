@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jusi-acp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "ACP plugin family and shared interactive client for Jusi 1.0"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,9 @@ Repository = "https://github.com/notawhaleble/jusi-acp"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jusi_acp"]
+
+[tool.hatch.version]
+path = "src/jusi_acp/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

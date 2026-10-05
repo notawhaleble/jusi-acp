@@ -206,3 +206,45 @@ def test_tool_input_and_command_survive_partial_updates(tmp_path):
     assert row["tool"] == "execute"
     assert row["raw"]["rawInput"] == {"command": "ls -la"}
     assert row["status"] == "completed"
+
+
+def test_chunk_usage_keeps_latest_cumulative_snapshot_and_replays(tmp_path, monkeypatch):
+    from acp.schema import AgentMessageChunk
+
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    store = EventStore("gigacode", tmp_path)
+    store.bind_session("chunk-usage", load_cache=False)
+    store.add({"kind": "user_prompt", "text": "hello"})
+    latest = {"inputTokens": 57449, "outputTokens": 100, "totalTokens": 57569,
+              "thoughtTokens": 20, "cachedReadTokens": 0, "cachedWriteTokens": 0}
+    for usage in ({**latest, "outputTokens": 50, "totalTokens": 57519}, latest, latest):
+        store.add(AgentMessageChunk.model_validate({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hi"},
+            "_meta": {"usage": usage},
+        }))
+    store.add({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "!"}})
+    store.add({"kind": "turn_stopped", "stopReason": "end_turn"})
+    row = store.turns_snapshot()[0]
+    assert row["usage"] == latest
+    for column, value in {"input_tokens": 57449, "output_tokens": 100,
+                          "total_tokens": 57569, "thought_tokens": 20,
+                          "cached_read_tokens": 0, "cached_write_tokens": 0}.items():
+        assert row[column] == value
+    cached = EventStore("gigacode", tmp_path)
+    cached.bind_session("chunk-usage", load_cache=True)
+    assert cached.turns_snapshot() == [row]
+    store.add({"kind": "user_prompt", "text": "next"})
+    assert "usage" not in store.turns_snapshot()[1]
+
+
+def test_final_usage_overrides_chunk_metadata_snapshot(tmp_path):
+    store = EventStore("gigacode", tmp_path, persist=False)
+    store.add({"kind": "user_prompt", "text": "hello"})
+    store.add({"sessionUpdate": "agent_message_chunk", "meta": {
+        "usage": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}},
+        "content": {"type": "text", "text": "hi"}})
+    assert store.turns_snapshot()[0]["total_tokens"] == 12
+    store.add({"kind": "turn_stopped", "stopReason": "end_turn", "usage": {
+        "inputTokens": 10, "outputTokens": 3, "totalTokens": 13}})
+    assert store.turns_snapshot()[0]["total_tokens"] == 13

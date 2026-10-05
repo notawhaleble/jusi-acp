@@ -238,19 +238,29 @@ class EventStore:
             for option in row.get("raw", {}).get("configOptions", []):
                 if option.get("category") == "model" or option.get("id") == "model":
                     turn["model"] = str(option.get("currentValue", ""))
+        usage = raw.get("usage") if kind == "turn_stopped" else None
+        if kind == "agent_message_chunk":
+            # GigaCode reports cumulative turn usage on selected chunks.
+            # Replace snapshots rather than adding them; chunks without usage
+            # and a final reply without usage must retain the latest snapshot.
+            for key in ("meta", "_meta"):
+                metadata = raw.get(key)
+                if isinstance(metadata, dict) and isinstance(metadata.get("usage"), dict):
+                    usage = metadata["usage"]
+                    break
+        if isinstance(usage, dict):
+            turn["usage"] = deepcopy(usage)
+            for wire, column in (
+                ("totalTokens", "total_tokens"),
+                ("inputTokens", "input_tokens"),
+                ("outputTokens", "output_tokens"),
+                ("thoughtTokens", "thought_tokens"),
+                ("cachedReadTokens", "cached_read_tokens"),
+                ("cachedWriteTokens", "cached_write_tokens"),
+            ):
+                if usage.get(wire) is not None:
+                    turn[column] = usage[wire]
         if kind == "turn_stopped":
-            if isinstance(usage := raw.get("usage"), dict):
-                turn["usage"] = deepcopy(usage)
-                for wire, column in (
-                    ("totalTokens", "total_tokens"),
-                    ("inputTokens", "input_tokens"),
-                    ("outputTokens", "output_tokens"),
-                    ("thoughtTokens", "thought_tokens"),
-                    ("cachedReadTokens", "cached_read_tokens"),
-                    ("cachedWriteTokens", "cached_write_tokens"),
-                ):
-                    if usage.get(wire) is not None:
-                        turn[column] = usage[wire]
             turn["events"].append(_presentation_row(row))
             stop_reason = str(row.get("status", "") or "")
             turn["stop_reason"] = stop_reason

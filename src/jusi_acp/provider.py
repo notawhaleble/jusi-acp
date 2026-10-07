@@ -19,8 +19,11 @@ class AgentLaunch:
     cwd: Path
     environment: Mapping[str, str] = field(default_factory=dict)
     auth_method: str = ""
+    protocol_version: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.protocol_version) is not int or self.protocol_version not in (1, 2):
+            raise ValueError("ACP protocol_version must be 1 or 2")
         if not self.argv or not self.argv[0]:
             raise ValueError("ACP agent argv must contain a command")
         if not self.cwd.is_absolute():
@@ -37,6 +40,7 @@ class AgentLaunch:
             "cwd": str(self.cwd),
             "environment": dict(self.environment),
             "auth_method": self.auth_method,
+            "protocol_version": self.protocol_version,
         }
 
 

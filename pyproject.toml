@@ -24,10 +24,15 @@ classifiers = [
 dependencies = [
   "agent-client-protocol>=0.12.1,<0.13",
   "jusi[vd]>=1.0.2,<2",
+  "jsonschema[format]>=4.23,<5",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+v2 = ["agent-client-protocol @ git+https://github.com/agentclientprotocol/python-sdk.git@9d07d7871ef4b220b8507e15fc4b1560f0950a64"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [project.urls]
 Repository = "https://github.com/notawhaleble/jusi-acp"

@@ -72,7 +72,7 @@ if BROWSE then
 end
 local streamed = vim.wait(10000, function() return screen():find(BROWSE and "old prompt" or "AUTOMATIC%-STREAM") ~= nil end, 50)
 local stream_screen = screen()
-local stopped = vim.wait(10000, function() return screen():find("ACP turn", 1, true) ~= nil end, 50)
+local stopped = vim.wait(10000, function() return screen():find("Turn Stopped", 1, true) ~= nil end, 50)
 local turn_screen = screen()
 pcall(vim.fn.chansend, job, string.char(5))
 local error_seen = vim.wait(5000, function() return screen():find("RequestError") ~= nil end, 50)

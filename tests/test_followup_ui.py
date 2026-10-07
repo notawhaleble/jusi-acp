@@ -36,7 +36,7 @@ def test_questions_follow_the_real_jusi_notebook_ux(tmp_path):
                          env=env, cwd=tmp_path, capture_output=True, text=True, timeout=100)
     assert run.returncode == 0, run.stderr
     result = json.loads(result_path.read_text())
-    assert result["ok"], result.get("failure", "") + "\n" + result.get("stderr", "")
+    assert result["ok"], result.get("failure", "") + "\n" + result.get("stderr", "") + "\n" + result.get("completion_screen", "")
     events = [json.loads(line) for path in (tmp_path / "state").rglob("events.jsonl")
               for line in path.read_text().splitlines()]
     prompts = [row["text"] for row in events if row["type"] == "user_prompt"]

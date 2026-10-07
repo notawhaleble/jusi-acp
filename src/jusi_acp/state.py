@@ -11,6 +11,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from .session import SessionProjection
+
 
 def state_root(provider: str, cwd: Path) -> Path:
     base = os.environ.get("JUSI_STATE_HOME") or os.environ.get("XDG_STATE_HOME")
@@ -34,12 +36,14 @@ class EventStore:
     _lock: Lock = field(default_factory=Lock, repr=False)
     _active_turn: dict[str, Any] | None = field(default=None, init=False, repr=False)
     persist: bool = field(default=True, repr=False)
+    session: SessionProjection = field(default_factory=SessionProjection)
 
     def bind_session(self, session_id: str, *, load_cache: bool) -> None:
         with self._lock:
             rebinding_session = bool(self.session_id)
             self.session_id = session_id
             if rebinding_session:
+                self.session = SessionProjection()
                 self.rows.clear()
                 self.turns.clear()
                 self._active_turn = None
@@ -59,6 +63,7 @@ class EventStore:
         except (OSError, json.JSONDecodeError):
             return
         with self._lock:
+            self.session = SessionProjection()
             self.rows[:] = cached
             self.turns.clear()
             self._active_turn = None
@@ -185,7 +190,12 @@ class EventStore:
             Path(name).unlink(missing_ok=True)
         self.persist = True
 
+    def activity_snapshot(self, category: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            return self.session.snapshot(category)
+
     def _project(self, row: dict[str, Any]) -> None:
+        self.session.apply(row)
         kind = str(row.get("type", ""))
         if kind == "user_message_chunk" and self._active_turn is not None:
             events = self._active_turn["events"]
@@ -291,6 +301,8 @@ class EventStore:
 def _json_value(value: Any) -> dict[str, Any]:
     if hasattr(value, "model_dump"):
         dumped = value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        # Preserve explicit null patches while retaining default discriminators.
+        dumped.update(value.model_dump(mode="json", by_alias=True, exclude_unset=True))
         return dict(dumped) if isinstance(dumped, dict) else {"value": dumped}
     return dict(value) if isinstance(value, dict) else {"value": str(value)}
 
@@ -351,6 +363,12 @@ def _diffs(raw: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in raw.get("content", []) if isinstance(raw.get("content"), list) else []:
         if isinstance(item, dict) and item.get("type") == "diff":
+            if "changes" in item:
+                for change in item.get("changes") or []:
+                    result.append({"path": change.get("path", "change"), "change": change.get("operation", "unknown"),
+                                   "old_path": change.get("oldPath"), "patch": deepcopy(item.get("patch")),
+                                   "raw": deepcopy(change)})
+                continue
             result.append({
                 "path": str(item.get("path", "change.txt")),
                 "old_text": str(item.get("oldText", "") or ""),

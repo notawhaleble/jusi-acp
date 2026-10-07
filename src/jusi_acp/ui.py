@@ -105,6 +105,9 @@ def make_events_sheet(
         "open diffs supplied for this event",
     )
     sheet.runtime = runtime
+    for key, category in [("P", "plan"), ("T", "terminal"), ("W", "tool"), ("Q", "questions"), ("D", "changes"), ("S", "details")]:
+        sheet.addCommand(key, "jusi-acp-view-" + category,
+                         f"sheet.runtime.open_session_view('{category}')", "open session " + category)
     return sheet
 
 
@@ -258,7 +261,49 @@ def make_questions_sheet(runtime: Any, state: dict[str, Any]) -> Any:
         source=question_text(state).splitlines(),
     )
     sheet.options.wrap = True
+    sheet.jusi_acp_request_id = state["request_id"]
+    for key, action in [("ENTER", "accept"), ("x", "cancel"), ("D", "decline"), ("s", "skip")]:
+        sheet.addCommand(key, "jusi-acp-question-" + action,
+            f"sheet.runtime.question_action('{action}', sheet.jusi_acp_request_id)", action + " displayed request")
+    sheet.addCommand("Q", "jusi-acp-pending", "sheet.runtime.open_session_view('questions')", "inspect question queue")
+    sheet.addCommand("e", "jusi-acp-form-fields", "sheet.runtime.open_form(sheet.jusi_acp_request_id)", "edit short form values")
     sheet.addCommand("c", "jusi-acp-cancel-waiting-turn", "sheet.runtime.cancel_initial()",
                      "cancel the waiting ACP turn")
     sheet.runtime = runtime
+    return sheet
+
+
+def make_session_view(runtime: Any, category: str) -> Any:
+    from visidata import vd, ItemColumn, Sheet
+    class SessionSheet(Sheet):
+        def openRow(self, row, rowidx=None):
+            runtime.open_entity(category, row)
+    sheet = SessionSheet(f"acp:{runtime.alias}:{category}",
+        rows=runtime.store.activity_snapshot(category),
+        columns=[ItemColumn("identity", width=18), ItemColumn("title", width=35),
+                 ItemColumn("status", width=25), ItemColumn("command", width=40),
+                 ItemColumn("cwd", width=30), ItemColumn("text", width=80)])
+    sheet.runtime = runtime
+    return sheet
+
+
+def make_form_sheet(runtime: Any, request_id: str, schema: dict, answers: dict) -> Any:
+    from visidata import vd, ItemColumn, Sheet
+    class FormSheet(Sheet):
+        def edit_value(self):
+            row = self.cursorRow
+            if not row:
+                return
+            value = vd.input(row['field'] + ': ', value=row['value'])
+            runtime.edit_form_value(request_id, row['field'], value)
+            row['value'] = value
+            self.recalc()
+    import json
+    rows = [{'field': key, 'type': spec.get('type'),
+             'value': (answers[key] if isinstance(answers.get(key), str) else json.dumps(answers[key])) if key in answers else '',
+             'description': spec.get('description', '')} for key, spec in (schema.get('properties') or {}).items()]
+    sheet = FormSheet('Review form fields', rows=rows,
+        columns=[ItemColumn('field', width=25), ItemColumn('type', width=12),
+                 ItemColumn('value', width=60), ItemColumn('description', width=60)])
+    sheet.addCommand('e', 'jusi-acp-edit-field', 'sheet.edit_value()', 'edit a short form value')
     return sheet

@@ -6,9 +6,16 @@ import os
 import sys
 
 from acp import PROTOCOL_VERSION, run_agent
-from acp.helpers import update_agent_message_text, update_user_message_text
+from acp.schema import AgentMessageChunk, UserMessageChunk, TextContentBlock
+
+def update_agent_message_text(text):
+    return AgentMessageChunk(session_update="agent_message_chunk", content=TextContentBlock(type="text", text=text))
+
+def update_user_message_text(text):
+    return UserMessageChunk(session_update="user_message_chunk", content=TextContentBlock(type="text", text=text))
 from acp.schema import (
     AgentCapabilities,
+    AuthMethodAgent,
     CurrentModeUpdate,
     Implementation,
     InitializeResponse,
@@ -41,7 +48,7 @@ class FakeAgent:
                     list={}, resume={}, close={}, additional_directories={}
                 ),
             ),
-            auth_methods=[{"id": "browser", "name": "Browser"}],
+            auth_methods=[AuthMethodAgent(id="browser", name="Browser")],
             agent_info=Implementation(name="fake", title="Fake ACP Agent", version="1"),
         )
 

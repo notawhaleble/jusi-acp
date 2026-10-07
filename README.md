@@ -53,7 +53,7 @@ To browse sessions without putting an ID in the magic header, start a cell with:
 /sessions
 ```
 
-Enter on a session loads its history into the turns sheet. Later Jusi follow-ups
+Enter on a session loads its history into session Activity. Later Jusi follow-ups
 continue that selected session.
 While loading, follow-ups and further selections are rejected with a wait message.
 A failed load preserves the previous session and its displayed history.
@@ -109,127 +109,157 @@ The provider must use the same ID and version in its catalog, kernel adapter,
 and `ProviderSpec`. It must not register `%%acp` itself or store live sessions
 globally.
 
-## Shared behavior
+## Session presentation
 
-- ACP v1 over the official Python SDK.
-- Python 3.10 or newer.
-- `execute`, `followup`, `complete`, `interrupt`, and `editor_actions` for every
-  exact provider claiming the family.
-- Markdown syntax and indentation in ACP prompt cells.
-- ACP terminal methods run bounded, non-interactive subprocesses at the target.
-- ACP filesystem, elicitation, and terminal-auth capabilities are not
-  advertised in the initial release.
-- Agent-driven authentication is available through `/auth METHOD_ID` or an
-  exact provider's configured `AgentLaunch.auth_method`.
-- `/sessions`, `/mode ID`, `/config ID VALUE`, and `/cancel` are family commands.
-- Initial bodies and later follow-ups use the same family-command dispatcher.
-- ACP `available_commands_update` entries appear in completion and in the event
-  sheet with their descriptions and optional free-text input hints. Invoking an
-  advertised slash command sends its complete text as a regular ACP prompt;
-  command-specific behavior and output remain agent-owned.
-- Press `d` on a tool event to open its ACP-provided diff. Press `d` on a turn
-  to browse all files changed during that turn, then Enter to open one through
-  Jusi's acknowledged, remote-safe read-only Vim diff action. Continuous edits
-  to one path are composed; discontinuous revisions remain separate.
-- ACP remains authoritative for conversation context. The family stores a
-  normalized read-only presentation cache so resume-only sessions retain useful
-  review history.
-- The live event view groups adjacent assistant and thought chunks, consolidates
-  tool updates by call ID, and updates terminal output in place while retaining
-  every raw ACP update in the durable journal.
-- Completed prompts appear as one row each in a turns sheet. Enter opens that
-  turn's grouped event view; turn completion returns focus to the summary.
+The default view is session Activity. Messages, tools, plans, terminals, and
+requests belong to the session, independently of foreground prompt completion.
+Background updates remain visible while the agent is idle. Streaming content is
+consolidated by entity ID; significant tool/terminal status and plan changes also
+produce activity notices. The raw journal retains the original updates.
 
-The first turn begins inside the terminal application after Jusi creates the
-client. It is cancellable with the application's `c` command or `/cancel`, but
-is not published as a Jusi client operation. Later follow-ups are exact Jusi
-operations and support `:JusiInterrupt` without closing the session.
+Activity commands:
+
+| Key | View/action |
+| --- | --- |
+| Enter | Inspect the selected message, tool, plan, or terminal |
+| P | Plans, with current entries |
+| T | Agent-owned terminals and live read-only transcripts |
+| W | Tool calls |
+| Q | Inspect pending questions in arrival order |
+| D | Session-wide agent-reported changes |
+| S | Session state, metadata, configuration, usage |
+| d | Diffs for the selected tool |
+| c | Request cancellation of session work |
+
+Views do not automatically return to a turns summary when foreground work ends.
+Browsing the queue does not change the answer target. Tool and terminal views
+refresh while open. Terminal output is rendered as sanitized text, never executed
+as escape sequences in the hosting terminal. V2 terminals are display-only:
+there are no input, resize, kill, or process-control actions. V1 retains its
+client-owned, bounded subprocess execution methods.
+
+ACP remains authoritative for conversation context. The local journal is a
+read-only presentation cache, not agent memory. Historical v1 turn projections
+remain available internally for compatibility; new session views do not depend
+on them. Context usage and cumulative costs are session state, not inferred
+per-prompt totals. Unknown content and update payloads remain in diagnostics/raw
+history; media playback is not provided by the terminal UI.
+
+## Questions and elicitation
+
+Questions from the foreground agent and background work share one FIFO queue.
+A request containing several questions keeps those questions together in its
+original order. The active question occupies the entire VisiData window, with
+its multiline body, choices, source where available, and pending-request count.
+New arrivals do not replace it or reset its scroll position.
+
+Write substantial answers in the notebook cell in Vim and submit the normal
+Jusi follow-up. Each follow-up answers the displayed question. Text, indentation,
+and multiline content are preserved. Option labels are available in completion.
+While a question is active, slash-prefixed text is answer text except `/cancel`.
+Closing or inspecting a view does not answer or cancel a request.
+
+Qwen/GigaCode `rawInput.questions` requests retain their existing permission
+extension response format. Their answers are collected and delivered together.
+Independent pending requests can be answered without waiting for unrelated work.
+
+ACP v2 elicitation supports:
+
+- **Form:** fields are presented sequentially. Text uses normal follow-ups;
+  numeric, boolean, and multi-select answers use JSON values. Invalid answers do
+  not advance the queue. Optional fields can be omitted with `s`. After the fields
+  are complete, review the entire response and press Enter to submit. `e` opens
+  a VisiData field sheet for short edits; it does not create a Vim buffer.
+- **URL:** the focused view shows the full URL and destination host. Enter opens
+  the configured browser only after explicit consent. Accepting the URL means
+  opening it, not completion of the external workflow. Completion notifications
+  are tracked separately.
+
+For elicitation, `D` declines the request and `x` cancels it. Form responses can
+be edited before submission. Forms must not be used to collect credentials;
+external authorization belongs in URL mode. No browser page or credential content
+is read by this client.
+
+If the active request is withdrawn, its view remains as a notice. Follow-up text
+is rejected rather than redirected to another request. Enter acknowledges the
+withdrawal and advances the queue. Once the queue is empty, ordinary follow-ups
+are prompts again. Requests arriving while a user is composing a prompt cannot
+be correlated with editor drafts by the current Jusi contract; check the focused
+question view before submission.
+
+## Protocol versions
+
+The default remains the published v1 SDK (`agent-client-protocol 0.12.x`). ACP v2
+is opt-in because both the protocol and Python SDK surface are experimental.
+Install the pinned upstream SDK through the extra:
+
+```sh
+pip install 'jusi-acp[v2]'
+# From this checkout:
+pip install -e '.[dev,v2]'
+```
+
+The exact provider selects v2 in its launch declaration:
+
+```python
+return AgentLaunch(("my-agent", "--acp"), cwd, protocol_version=2)
+```
+
+The v2 extra pins upstream commit
+`9d07d7871ef4b220b8507e15fc4b1560f0950a64`. That commit still identifies itself as
+0.12.1; checking the package version alone cannot establish v2 availability.
+The v2 adapter requires `acp.experimental.v2` and fails visibly if it is missing.
+The configured version is initialized explicitly. There is no automatic downgrade
+or agent restart; use the default `protocol_version=1` for v1 agents.
+
+For v2, successful follow-up completion means **the message was accepted**, not
+that foreground or background work finished. Messages reconcile with the
+agent-generated ID. Foreground state and errors arrive independently through
+`state_update`. The client does not fabricate prompt ownership for background
+updates. In v1, the existing prompt-response completion behavior remains.
+
+Use `/cancel` or `c` for session cancellation. `:JusiInterrupt` can interrupt an
+active Jusi operation; after v2 acceptance there is no such operation to target.
+This package does not extend Jusi core with application-owned work publication.
+
+V2 supports message/tool upserts and explicit null clears, streamed tool content,
+plans by ID, terminal byte chunks and replacement snapshots, permission subjects,
+structured diff operations and patch display, configuration/command/metadata/usage
+updates, and full replay through `session/resume`. `--load` maps to resume with
+`replayFrom: {type: "start"}`; `--resume` requests no replay. Supplied stdio MCP
+configuration gains its v2 type discriminator; deprecated SSE configuration is
+rejected. Authentication through `/auth METHOD_ID` uses `auth/login` in v2.
+
+Client terminal authentication, provider-specific worker trees, plan editing,
+remote ACP transports, and other unstable extension surfaces are not advertised.
+A worker's source is shown only when the agent supplies it. Plan entry identity is
+not inferred across revisions; baseline plans replace their full entries list.
+V2 diffs are shown as supplied patches rather than reconstructing absent complete
+file contents; v1 text diffs retain native read-only Vim diff delivery.
 
 ## Development
 
+For prompts, expected UI behavior, and provider-dependent scenarios, see the
+[ACP v2 manual testing guide](docs/manual-testing-v2.md).
+
 ```sh
 python3.12 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install -e '.[dev,v2]'
 .venv/bin/pytest
 ```
 
-The notebook follow-up integration test uses a sibling `jusi` frontend checkout,
-or the path supplied in `JUSI_NVIM_ROOT`, together with the installed Python
-backend. It edits notebook cells through Neovim and checks the real serialized
-follow-up lane, answer history, and same-client reuse.
+The real notebook integration test uses a sibling `jusi` frontend checkout or
+`JUSI_NVIM_ROOT`, together with the installed Python backend. It edits cells
+through Neovim and verifies follow-up serialization, answer history, cancellation,
+same-client reuse, and editor diff delivery. V2 tests include a separate JSON-RPC
+subprocess fixture that accepts prompts before emitting background activity and
+concurrent elicitation requests.
 
-### Turn review and questions
+To collect recent target-side diagnostics:
 
-The turns sheet records the model ID reported by the agent, from either model
-configuration or older ACP session model metadata. It stays blank when the
-agent does not report a model; it is not inferred from the executable name.
-Tool events show the tool name/kind, command, and raw input when supplied.
-The reply column contains the final agent message from each turn, and `changes`
-counts paths for which the agent supplied ACP diff content. Enter opens the full
-event details. An empty changes view means the agent supplied no diffs; it does
-not prove that no files changed.
+```sh
+python -m jusi_acp.diagnostics
+```
 
-Usage is presented by the ACP family whenever the agent reports it. The turns
-sheet shows `total_tokens`, `input_tokens`, `output_tokens`, `thought_tokens`,
-`cached_read_tokens`, and `cached_write_tokens` from the final prompt response,
-plus the latest `context_used`, `context_size`, cumulative `session_cost`, and
-`currency` from ACP `usage_update` notifications. Zero is displayed as zero;
-unreported values stay blank, and a new turn does not inherit old usage. These
-snapshots survive presentation-cache reloads. Enter on a turn opens its events;
-Enter on a usage or stop event exposes the original payload and metadata.
-Usage columns follow the existing turn review columns; scroll horizontally to
-see the full breakdown.
-
-Context usage is the number of tokens currently in the context window, not
-tokens consumed by a turn. Cost is cumulative for the session. Final response
-token usage is experimental and is displayed exactly as reported: ACP's
-[usage scope ambiguity](https://github.com/agentclientprotocol/agent-client-protocol/issues/1860)
-means agents may report per-turn or cumulative token counts. The family does not
-sum them or infer deltas. Provider-specific usage hidden in extension metadata
-needs an explicit provider mapping; arbitrary metadata is preserved without
-guessing its meaning.
-
-Qwen/GigaCode question requests carried in `rawInput.questions` pause the agent
-and show the current question and choices in a read-only view. Type your answer
-in the notebook cell in Vim and submit it using the usual Jusi follow-up action.
-Each follow-up answers one question. Write the option label (available in cell
-completion) or any free-form, multiline answer; text and whitespace are preserved.
-For multiple-choice questions, describe all your choices in the answer. An empty
-answer is rejected without advancing to the next question.
-
-When a question arrives, the current Jusi operation returns successfully with
-`status: awaiting_answer`, freeing the follow-up lane while keeping the ACP
-request pending. After the last answer, that same ACP turn resumes, and the
-answer follow-up stays active until the turn finishes or asks another question.
-Answers remain in the original turn's event history and in normal Jusi follow-up
-history; they never become separate agent prompts. Once the turn finishes, the
-next follow-up starts a new prompt as usual.
-
-Submit `/cancel` from the cell to cancel a waiting turn, including any partially
-answered question set. Closing the question view just hides it; it does not
-answer or cancel anything. While waiting, all other cell text is an answer,
-including slash-prefixed text. During resumed work, use `:JusiInterrupt` as usual.
-While waiting for input there is no active Jusi operation to interrupt, so use
-`/cancel` (or `c` in the question view). No text entry in VisiData is required.
-
-Ordinary tool permission requests retain their approval choices, with `d`
-exposing the full request payload. Questions use the
-[Qwen permission extension](https://github.com/QwenLM/qwen-code/blob/main/packages/vscode-ide-companion/src/services/acpConnection.ts),
-not generic ACP elicitation.
-
-ACP UI updates run from the drawing thread with a bounded curses polling interval,
-including while the terminal has no focus. Recoverable SDK protocol errors stay
-in event diagnostics; runtime failures use VisiData's Ctrl-E error history. Agent
-stderr appears as labelled diagnostic events, including during authentication.
-Browser launcher environment variables are preserved, and provider environment
-overrides take precedence.
-
-Qwen's `qwen/notify/session/prompt-suggestion` notification is accepted as an
-advisory `Suggested follow-up` journal event. It never submits a prompt or edits
-the notebook, and does not replace the completed turn's reply.
-
-To collect the last ten saved ACP diagnostics on the target machine, run
-`python -m jusi_acp.diagnostics` using the same Python environment as Jusi.
-It prints package versions and diagnostic messages, including the method and
-parameters of a failed notification when captured. Check that output before
-sharing it: agent-supplied notification parameters may contain private data.
+Diagnostics may contain agent-supplied private content. Qwen's prompt-suggestion
+notification remains advisory: it neither submits a prompt nor edits the notebook.

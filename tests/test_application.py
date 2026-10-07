@@ -600,7 +600,7 @@ def test_interrupt_before_answer_submission_does_not_answer_question(tmp_path, m
         app.close()
 
 
-def test_finished_turn_cancels_outstanding_question_target(tmp_path, monkeypatch):
+def test_finished_turn_preserves_session_owned_question_target(tmp_path, monkeypatch):
     from acp.schema import PermissionOption, ToolCallUpdate
     monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
     app = ACPApplication(_payload(tmp_path))
@@ -623,9 +623,12 @@ def test_finished_turn_cancels_outstanding_question_target(tmp_path, monkeypatch
         assert result["status"] == "awaiting_answer"
         finish.set()
         await app._turn_task
+        assert app._answer_state is not None
+        assert app._questions
+        result = await app._answer_question("Background answer")
+        assert result["status"] == "answer_submitted"
+        assert (await permission_task).answers == {"0": "Background answer"}
         assert app._answer_state is None
-        assert not app._questions
-        assert (await permission_task).outcome.outcome == "cancelled"
     asyncio.run(run())
 
 

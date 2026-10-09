@@ -117,8 +117,10 @@ globally.
   exact provider claiming the family.
 - Markdown syntax and indentation in ACP prompt cells.
 - ACP terminal methods run bounded, non-interactive subprocesses at the target.
-- ACP filesystem, elicitation, and terminal-auth capabilities are not
-  advertised in the initial release.
+- ACP filesystem and terminal-auth capabilities are not advertised.
+- Form and URL elicitation are supported using the published v1 SDK. The SDK
+  classifies these routes as unstable; this does not enable ACP v2 or require
+  a Git dependency.
 - Agent-driven authentication is available through `/auth METHOD_ID` or an
   exact provider's configured `AgentLaunch.auth_method`.
 - `/sessions`, `/mode ID`, `/config ID VALUE`, and `/cancel` are family commands.
@@ -138,7 +140,10 @@ globally.
   tool updates by call ID, and updates terminal output in place while retaining
   every raw ACP update in the durable journal.
 - Completed prompts appear as one row each in a turns sheet. Enter opens that
-  turn's grouped event view; turn completion returns focus to the summary.
+  turn's grouped event view. Completion selects that turn and opens its last
+  assistant message as a wrapped VisiData text sheet. Close it with `q` to return
+  to the selected turn. Notebook focus stays where it is; a new prompt replaces
+  the automatic preview. Pending questions take priority.
 
 The first turn begins inside the terminal application after Jusi creates the
 client. It is cancellable with the application's `c` command or `/cancel`, but
@@ -203,7 +208,9 @@ request pending. After the last answer, that same ACP turn resumes, and the
 answer follow-up stays active until the turn finishes or asks another question.
 Answers remain in the original turn's event history and in normal Jusi follow-up
 history; they never become separate agent prompts. Once the turn finishes, the
-next follow-up starts a new prompt as usual.
+next follow-up starts a new prompt unless a session request is still pending.
+Requests can arrive after prompt completion and remain answerable until resolved
+or cancelled; prompt completion alone does not cancel them.
 
 Submit `/cancel` from the cell to cancel a waiting turn, including any partially
 answered question set. Closing the question view just hides it; it does not
@@ -233,3 +240,86 @@ To collect the last ten saved ACP diagnostics on the target machine, run
 It prints package versions and diagnostic messages, including the method and
 parameters of a failed notification when captured. Check that output before
 sharing it: agent-supplied notification parameters may contain private data.
+
+
+## Session activity on ACP v1
+
+The default sheet remains prompt-centric: one row per user prompt, with Enter
+for its grouped events and Ctrl-O on a cell for the usual Vim representation.
+Known tool, terminal, and message IDs route late updates to their original group,
+even while another prompt runs. The `updates` column counts late updates; opening
+the turn clears its indicator. A message ID is only correlated after its first
+appearance; its value is never interpreted as a turn identifier.
+
+Events arriving idle without a known owner appear together in an **Unassigned
+session activity** row between prompts. Enter opens that group. During a prompt,
+otherwise uncorrelated events are grouped by their arrival during that prompt;
+this is presentation context, not proof of worker ownership. Raw updates remain
+available in the journal. No worker identity is inferred from message wording
+or arbitrary extension metadata.
+
+From the turns, events, or reply views:
+
+| Key | View |
+| --- | --- |
+| `p` | Current session plan |
+| `P` on a turn | Plan revisions received in that turn |
+| `t` | Client-owned terminal monitor; Enter opens live output |
+| `w` | Pending requests in arrival order; Enter previews without retargeting answers |
+| `a` | Return to the active full-screen question |
+
+`/plan`, `/terminals`, and `/pending` also open these views from a follow-up when
+no question is waiting. Closing a view does not stop work. Terminal output follows
+the end while you are at the bottom; scrolling up keeps your position. Output
+limits and truncation indicators come from the client terminal service. Commands
+run internally by the agent do not appear here unless it uses ACP terminal calls.
+
+Each standard plan update replaces the current plan in full, including an empty
+plan. Historical snapshots stay with the turn or unassigned group where they
+arrived. ACP v1 does not supply standard task/plan identities for independent
+worker plans, so the client presents one current session plan.
+
+## Pending requests and elicitation
+
+Questions, approvals, and elicitations share one FIFO queue. A request containing
+several questions keeps its place until those questions are answered. The main
+view shows the full current question; its title shows the source and the number
+of other queued requests. Later arrivals do not replace it or reset scrolling.
+
+Elicitation is an agent request for user-provided information. Form elicitation
+uses the same follow-up flow for free text. Short structured fields have an
+editable value cell: `e` edits it and Enter submits it. They can also be answered
+from the notebook. Booleans use `true`/`false`, numbers use JSON numbers, and
+multi-select fields use a JSON array of strings. Invalid answers leave the same
+field active. Optional fields support `/skip`, supplied defaults support
+`/default`, and `/empty` supplies an empty string. `/decline` declines an
+elicitation; `/dismiss` cancels only that elicitation. URL elicitation displays
+the URL for you to open; Enter or `/accept` acknowledges it without claiming that
+external work is complete. Agent completion notifications are recorded separately.
+
+If the active request is withdrawn, further answer text is rejected rather than
+sent to the next request. Submit `/next` to acknowledge the withdrawal and show
+the next question. `/cancel` still cancels the session's pending requests and
+active prompt. There are no additional Vim answer buffers.
+
+## Project path completion
+
+In a live ACP cell, type `@` and invoke normal Jusi completion (Tab). For example,
+`Explain @application` offers matching paths across the configured project.
+`@src/` narrows to that directory. Selecting a candidate inserts a plain relative
+path such as `./src/jusi_acp/application.py`: **the `@` is removed and no file is
+attached or read into the prompt**. Paths beginning `./` or `../` continue to
+complete, and spaces are backslash-escaped. Other prompt text, including text
+after the cursor, is preserved. Completion also works while answering questions.
+
+The target-side session working directory and configured additional directories
+are searched. Git projects respect Git ignore rules for untracked files; tracked
+files remain available. Outside Git, common generated directories are excluded.
+Results are bounded and cached briefly so completion does not scan on every key.
+
+Jusi currently requires a live client before completing a plugin cell. To complete
+your first prompt, execute an empty `%%acp ALIAS` cell first, then write the prompt
+as a follow-up. No agent prompt is sent by that empty initialization.
+
+See [the manual testing guide](docs/manual-testing.md) for prompts and expected
+behavior, including features that depend on what the agent actually reports.

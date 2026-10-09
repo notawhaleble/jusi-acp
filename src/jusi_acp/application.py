@@ -18,6 +18,10 @@ from uuid import uuid4
 from acp import PROTOCOL_VERSION, RequestError, spawn_agent_process
 from acp.schema import (
     AuthCapabilities,
+    ElicitationCapabilities,
+    AcceptElicitationResponse,
+    CancelElicitationResponse,
+    DeclineElicitationResponse,
     ClientCapabilities,
     CurrentModeUpdate,
     FileSystemCapabilities,
@@ -30,7 +34,8 @@ from . import __version__
 from .compat import MODE_NOTIFICATIONS, PROMPT_SUGGESTION_NOTIFICATION, install_mode_notifications
 from .ipc import ApplicationController
 from .state import EventStore
-from .questions import QuestionRequest, question_text
+from .questions import QuestionRequest, question_text, form_questions, parse_form_answer
+from .completion import PathCompleter
 from .terminal import TerminalManager
 from .ui import (
     PendingPermission,
@@ -39,6 +44,10 @@ from .ui import (
     make_events_sheet,
     make_permission_sheet,
     make_questions_sheet,
+    make_form_field_sheet,
+    make_plan_sheet,
+    make_terminals_sheet,
+    make_pending_sheet,
     make_sessions_sheet,
     make_turns_sheet,
     queue_action,
@@ -80,6 +89,15 @@ class ACPApplication:
         self.sheet: Any = None
         self.turns_sheet: Any = None
         self.live_sheet: Any = None
+        self.reply_sheet: Any = None
+        self.plan_sheet: Any = None
+        self.terminals_sheet: Any = None
+        self.terminal_output_sheet: Any = None
+        self.pending_sheet: Any = None
+        self._withdrawn_answer = False
+        self._pending_rows: list[dict[str, Any]] = []
+        self._operation_answer_target: tuple[str, int] | None = None
+        self._deferred_reply: int | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.connection: Any = None
         self.initialize_response: Any = None
@@ -113,7 +131,9 @@ class ACPApplication:
         self._refresh_follow_tail = False
         self._last_refresh = 0.0
         roots = (self.cwd, *self.additional_directories)
+        self._terminal_stores: dict[str, EventStore] = {}
         self.terminals = TerminalManager(roots, observer=self._terminal_changed)
+        self.path_completer = PathCompleter(roots)
         self._thread: threading.Thread | None = None
 
     # ACP client handlers -------------------------------------------------
@@ -163,7 +183,9 @@ class ACPApplication:
             details=json.dumps(tool_call.model_dump(mode="json", by_alias=True, exclude_none=True),
                                ensure_ascii=False, indent=2),
         )
-        self.store.add_status("Answers required" if questions else "Permission required", pending.details, "pending")
+        tool_id = str(getattr(tool_call, "tool_call_id", "") or "")
+        self.store.add({"kind": "status", "title": "Answers required" if questions else "Permission required",
+                        "text": pending.details, "status": "pending", "toolCallId": tool_id}, source="client")
         self._refresh()
         if questions:
             option = next((option for option in options if option.kind == "allow_once"), None)
@@ -171,17 +193,19 @@ class ACPApplication:
                 with self._permission_lock:
                     self._permissions.pop(request_id, None)
                 raise RequestError.invalid_params({"details": "Questions require an allow_once response option"})
-            self._questions[request_id] = QuestionRequest(request_id, questions, option.option_id)
-            self._publish_question()
+            self._questions[request_id] = QuestionRequest(request_id, questions, option.option_id,
+                                                        source=pending.title, tool_call_id=tool_id)
         else:
-            queue_action(lambda: self._push_permission(pending))
+            self._questions[request_id] = QuestionRequest(
+                request_id, [{"question": pending.details, "options": []}], "",
+                kind="permission", source=pending.title, tool_call_id=tool_id, pending=pending)
+        self._publish_question()
         try:
             option_id = await future
         finally:
             with self._permission_lock:
                 self._permissions.pop(request_id, None)
-            if self._questions.pop(request_id, None) is not None:
-                self._publish_question()
+            self._remove_request(request_id, withdrawn=future.cancelled())
         if option_id is None:
             return RequestPermissionResponse(outcome={"outcome": "cancelled"})
         if isinstance(option_id, dict):
@@ -191,13 +215,60 @@ class ACPApplication:
             )
         return RequestPermissionResponse(outcome={"outcome": "selected", "optionId": option_id})
 
+    async def create_elicitation(self, message: str, mode: Any, **kwargs: Any) -> Any:
+        raw = mode.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if raw.get("sessionId", self.session_id) != self.session_id:
+            return CancelElicitationResponse(action="cancel")
+        request_id = uuid4().hex
+        schema = raw.get("requestedSchema")
+        try:
+            questions = form_questions(message, schema) if schema is not None else [
+                {"question": message + "\n\n" + str(raw.get("url", "")), "options": []}]
+        except (ValueError, TypeError) as exc:
+            raise RequestError.invalid_params({"details": str(exc)}) from exc
+        request = QuestionRequest(request_id, questions, "", kind="form" if schema is not None else "url",
+                                  source="Elicitation" + (f" · {raw['toolCallId']}" if raw.get("toolCallId") else ""),
+                                  tool_call_id=raw.get("toolCallId", ""), schema=schema or {},
+                                  elicitation_id=raw.get("elicitationId", ""))
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        with self._permission_lock:
+            self._permissions[request_id] = (loop, future)
+        self._questions[request_id] = request
+        self._publish_question()
+        try:
+            response = await future
+        finally:
+            with self._permission_lock:
+                self._permissions.pop(request_id, None)
+            self._remove_request(request_id, withdrawn=future.cancelled())
+        if response is None or response.get("action") == "cancel":
+            return CancelElicitationResponse(action="cancel")
+        if response["action"] == "decline":
+            return DeclineElicitationResponse(action="decline")
+        return AcceptElicitationResponse(action="accept", content=response.get("content"))
+
+    async def complete_elicitation(self, elicitation_id: str, **kwargs: Any) -> None:
+        self.store.add_status("Elicitation completed", elicitation_id, "completed")
+        self._refresh()
+
+    def _remove_request(self, request_id: str, *, withdrawn: bool = False) -> None:
+        if withdrawn and self._answer_state and self._answer_state["request_id"] == request_id:
+            self._withdrawn_answer = True
+            queue_action(self._show_withdrawn_question)
+        if self._questions.pop(request_id, None) is not None:
+            self._publish_question()
+
     async def create_terminal(
         self, session_id: str, command: str, args: list[str] | None = None,
         env: list[Any] | None = None, cwd: str | None = None,
         output_byte_limit: int | None = None, **kwargs: Any,
     ) -> Any:
         _ = kwargs
+        if session_id != self.session_id:
+            raise RequestError.invalid_params({"details": "Unknown ACP session"})
         result = await self.terminals.create(session_id, command, args, env, cwd, output_byte_limit)
+        self._terminal_stores[result.terminal_id] = self.store
         self.store.update_terminal(result.terminal_id, "", False, "running",
                                    command=shlex.join([command, *(args or [])]))
         self._refresh()
@@ -308,6 +379,7 @@ class ACPApplication:
         capabilities = ClientCapabilities(
             fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
             terminal=True,
+            elicitation=ElicitationCapabilities(form={}, url={}),
             auth=AuthCapabilities(terminal=False),
         )
         async with spawn_agent_process(
@@ -317,6 +389,8 @@ class ACPApplication:
             env={**_agent_environment(), **self.environment},
             cwd=self.cwd,
             observers=[self._observe_protocol],
+            # Published v1 SDK gates elicitation routes behind this flag.
+            use_unstable_protocol=True,
         ) as (connection, process):
             self.connection = connection
             stderr_task = asyncio.create_task(self._drain_stderr(process))
@@ -483,6 +557,8 @@ class ACPApplication:
     async def _select_session(self, session_id: str) -> None:
         if self._session_loading:
             raise ValueError("A session is loading; wait before selecting another session")
+        if self._questions:
+            raise ValueError("Answer or dismiss pending requests before switching sessions")
         if self._turn_task is not None and not self._turn_task.done():
             raise ValueError("Cannot switch sessions while an ACP turn is running")
         old_action, old_requested = self.session_action, self.requested_session_id
@@ -527,6 +603,8 @@ class ACPApplication:
                 vd.remove(sheet)
         self.live_sheet = None
         self.sessions_sheet = None
+        self.reply_sheet = self.plan_sheet = self.terminals_sheet = self.terminal_output_sheet = self.pending_sheet = None
+        self._deferred_reply = None
         self._focus_turns_sheet()
 
     def _show_session_error(self, message: str) -> None:
@@ -557,6 +635,8 @@ class ACPApplication:
                 if self._operation_cancel is not None:
                     raise ValueError("Another ACP follow-up is active")
                 self._operation_cancel = threading.Event()
+                state = self._answer_state
+                self._operation_answer_target = (state["request_id"], state["question_number"]) if state else None
             return {"begun": True}
         if operation == "interrupt":
             self.cancel_initial()
@@ -574,6 +654,7 @@ class ACPApplication:
         finally:
             with self._operation_lock:
                 self._operation_cancel = None
+                self._operation_answer_target = None
 
     def _submit(self, coroutine: Any) -> dict[str, Any]:
         try:
@@ -607,8 +688,22 @@ class ACPApplication:
                 except InterruptedError:
                     pass
             return {"command": "cancel"}
+        if stripped == "/next" and self._withdrawn_answer:
+            self._withdrawn_answer = False
+            self._publish_question(force=True)
+            return dict(self._answer_state or {"status": "ready"})
+        if self._withdrawn_answer:
+            raise ValueError("The question you were answering was withdrawn. Your text was not sent. Submit /next to continue.")
+        if self._operation_answer_target is not None:
+            state = self._answer_state
+            if state is None or (state["request_id"], state["question_number"]) != self._operation_answer_target:
+                raise ValueError("The pending question changed; review it before submitting again")
         if self._answer_state is not None:
             return await self._answer_question(body)
+        if stripped in {"/plan", "/terminals", "/pending"}:
+            queue_action({"/plan": self.open_plan, "/terminals": self.open_terminals,
+                          "/pending": self.open_pending}[stripped])
+            return {"command": stripped[1:]}
         if stripped == "/sessions":
             if self._turn_task is not None and not self._turn_task.done():
                 raise ValueError("Cannot list sessions while an ACP turn is running")
@@ -666,7 +761,10 @@ class ACPApplication:
 
     async def _wait_for_turn(self) -> dict[str, Any]:
         task = self._turn_task
-        assert task is not None
+        if self._answer_state is not None and not self._cancel_requested.is_set():
+            return dict(self._answer_state)
+        if task is None:
+            return {"status": "ready", "session_id": self.session_id}
         while not task.done():
             if self._answer_state is not None and not self._cancel_requested.is_set():
                 return dict(self._answer_state)
@@ -679,21 +777,34 @@ class ACPApplication:
                 await asyncio.gather(changed, return_exceptions=True)
         return await asyncio.shield(task)
 
-    def _publish_question(self) -> None:
+    def _publish_question(self, *, force: bool = False) -> None:
         with self._permission_lock:
             waiting = {key for key, (_, future) in self._permissions.items() if not future.done()}
-        request = next((value for key, value in self._questions.items() if key in waiting), None)
-        self._answer_state = request.snapshot() if request is not None else None
+        requests = [value for key, value in self._questions.items() if key in waiting]
+        self._pending_rows = [dict(value.snapshot(), position=index + 1) for index, value in enumerate(requests)]
+        request = requests[0] if requests else None
+        state = request.snapshot() if request is not None else None
+        if state is not None:
+            state["pending_count"] = len(requests) - 1
+        previous = self._answer_state
+        if (not force and previous and state
+                and (previous["request_id"], previous["question_number"]) == (state["request_id"], state["question_number"])):
+            previous["pending_count"] = state["pending_count"]
+            queue_action(self._update_question_title)
+            self._refresh()
+            return
+        self._answer_state = state
         self._question_changed.set()
-        state = self._answer_state
         if state is not None:
             self.store.add({"kind": "question_waiting", "title": "Answer in Jusi follow-up",
+                            "toolCallId": state["tool_call_id"],
                             "text": question_text(state), "status": "awaiting_answer"}, source="client")
-            queue_action(lambda: self._show_question(state))
+            if not self._withdrawn_answer:
+                queue_action(lambda: self._show_question(state))
         else:
             self.store.add({"kind": "questions_resumed", "title": "Questions finished",
                             "status": "running"}, source="client")
-            queue_action(self._close_questions_sheet)
+            queue_action(self._questions_finished)
         self._refresh()
 
     async def _answer_question(self, body: str) -> dict[str, Any]:
@@ -702,17 +813,59 @@ class ACPApplication:
         state = self._answer_state
         assert state is not None
         request = self._questions[state["request_id"]]
+        prompt_running = self._turn_task is not None and not self._turn_task.done()
         with self._permission_lock:
             waiting = self._permissions.get(request.request_id)
         if waiting is None or waiting[1].done():
             raise ValueError("This question is no longer waiting for an answer")
-        request.answers[str(len(request.answers))] = body
-        self.store.add({"kind": "question_answer", "title": f"Answer {state['question_number']}",
-                        "text": body, "question": state["question"]}, source="user")
-        if len(request.answers) == len(request.questions):
+        if request.kind == "permission":
+            raise ValueError("Select the permission choice in VisiData with Enter")
+        if request.kind in {"form", "url"} and body.strip() in {"/decline", "/dismiss"}:
             self._questions.pop(request.request_id)
-            _resolve_future(waiting[1], {"option_id": request.option_id, "answers": dict(request.answers)})
+            _resolve_future(waiting[1], {"action": "decline" if body.strip() == "/decline" else "cancel"})
+        elif request.kind == "url":
+            if body.strip() != "/accept":
+                raise ValueError("Open the displayed URL, then press Enter to acknowledge, or submit /accept, /decline or /dismiss")
+            self._questions.pop(request.request_id)
+            _resolve_future(waiting[1], {"action": "accept"})
+        else:
+            question = request.questions[len(request.answers)]
+            if request.kind == "form" and not question.get("confirm"):
+                command = body.strip()
+                if command == "/skip":
+                    if question["required"]:
+                        raise ValueError("This field is required")
+                else:
+                    if command == "/default":
+                        if "default" not in question["schema"]:
+                            raise ValueError("This field has no default")
+                        default = question["schema"]["default"]
+                        body = default if isinstance(default, str) else json.dumps(default)
+                    elif command == "/empty":
+                        body = ""
+                    value = parse_form_answer(question, body)
+                    request.content[question["field"]] = value
+            elif question.get("confirm") and body.strip() != "/accept":
+                raise ValueError("Press Enter or submit /accept to confirm this request")
+            request.answers[str(len(request.answers))] = body
+            self.store.add({"kind": "question_answer", "title": f"Answer {state['question_number']}",
+                            "text": body, "question": state["question"],
+                            "toolCallId": request.tool_call_id}, source="user")
+            if len(request.answers) == len(request.questions):
+                if request.kind == "form":
+                    from jsonschema import Draft202012Validator, FormatChecker
+                    error = next(Draft202012Validator(request.schema, format_checker=FormatChecker()).iter_errors(request.content), None)
+                    if error is not None:
+                        request.answers.pop(str(len(request.answers) - 1))
+                        raise ValueError(error.message)
+                    response = {"action": "accept", "content": dict(request.content)}
+                else:
+                    response = {"option_id": request.option_id, "answers": dict(request.answers)}
+                self._questions.pop(request.request_id)
+                _resolve_future(waiting[1], response)
         self._publish_question()
+        if not prompt_running:
+            return dict(self._answer_state or {"status": "ready", "session_id": self.session_id})
         return await self._wait_for_turn()
 
     async def _prompt(self, body: str, *, initial: bool) -> dict[str, Any]:
@@ -747,17 +900,6 @@ class ACPApplication:
                 self._refresh()
                 queue_action(self._focus_turns_sheet)
                 raise
-            finally:
-                # Agents can stop a turn while a client request is outstanding.
-                # Never leave an answer target attached to a completed turn.
-                if self._questions:
-                    request_ids = list(self._questions)
-                    self._questions.clear()
-                    with self._permission_lock:
-                        futures = [self._permissions[key][1] for key in request_ids if key in self._permissions]
-                    for future in futures:
-                        _resolve_future(future, None)
-                    self._publish_question()
             stop_reason = str(response.stop_reason)
             stopped: dict[str, Any] = {"kind": "turn_stopped", "stopReason": stop_reason}
             usage = getattr(response, "usage", None)
@@ -765,7 +907,8 @@ class ACPApplication:
                 stopped["usage"] = usage.model_dump(mode="json", by_alias=True, exclude_none=True)
             self.store.add(stopped, source="agent")
             self._refresh()
-            queue_action(self._focus_turns_sheet)
+            if turn is not None:
+                queue_action(lambda: self._show_completed_turn(int(turn["turn"])))
             cancelled = (
                 self._cancel_requested.is_set()
                 if initial
@@ -796,6 +939,7 @@ class ACPApplication:
         self._refresh()
 
     def cancel_initial(self) -> None:
+        self._withdrawn_answer = False
         self._cancel_requested.set()
         with self._operation_lock:
             if self._operation_cancel is not None:
@@ -833,26 +977,114 @@ class ACPApplication:
         for loop, future in pending:
             loop.call_soon_threadsafe(_resolve_future, future, None)
 
-    def _push_permission(self, pending: PendingPermission) -> None:
-        with self._permission_lock:
-            waiting = self._permissions.get(pending.request_id)
-        if waiting is None or waiting[1].done():
-            return
-        from visidata import vd
-        vd.push(make_permission_sheet(self, pending))
-
     def _push_sessions(self, rows: list[dict[str, Any]]) -> None:
         from visidata import vd
         self.sessions_sheet = make_sessions_sheet(self, rows)
         vd.push(self.sessions_sheet)
 
     def _show_question(self, state: dict[str, Any]) -> None:
-        if state is not self._answer_state:
+        if state is not self._answer_state or self._withdrawn_answer:
             return
         from visidata import vd
         self._close_questions_sheet()
-        self.questions_sheet = make_questions_sheet(self, state)
+        request = self._questions.get(state["request_id"])
+        if request is None:
+            return
+        if request.kind == "permission":
+            self.questions_sheet = make_permission_sheet(self, request.pending)
+        elif state.get("structured"):
+            self.questions_sheet = make_form_field_sheet(self, state)
+        else:
+            self.questions_sheet = make_questions_sheet(self, state)
+        self._update_question_title()
         vd.push(self.questions_sheet)
+
+    def _update_question_title(self) -> None:
+        if self.questions_sheet is not None and self._answer_state is not None:
+            state = self._answer_state
+            self.questions_sheet.name = (f"ACP {state['kind']} {state['question_number']}/{state['question_count']}"
+                                         f" · {state['source']} · {state.get('pending_count', 0)} queued")
+
+    def _questions_finished(self) -> None:
+        if self._answer_state is not None or self._withdrawn_answer:
+            return
+        self._close_questions_sheet()
+        if self._deferred_reply is not None:
+            turn_number, self._deferred_reply = self._deferred_reply, None
+            self._show_completed_turn(turn_number)
+
+    def _show_withdrawn_question(self) -> None:
+        if not self._withdrawn_answer:
+            return
+        from visidata import vd, TextSheet
+        self._close_questions_sheet()
+        self.questions_sheet = TextSheet("Question withdrawn", source=[
+            "The question you were answering was withdrawn; your text will not be sent to another request.",
+            "Submit /next in your Jusi follow-up to show the next request."])
+        self.questions_sheet.runtime = self
+        vd.push(self.questions_sheet)
+
+    def reopen_question(self) -> None:
+        if self._withdrawn_answer:
+            self._show_withdrawn_question()
+        elif self._answer_state is not None:
+            self._show_question(self._answer_state)
+
+    def submit_ui_answer(self, state: dict[str, Any], body: str) -> None:
+        if self.loop is None or self.loop.is_closed():
+            return
+        async def submit() -> None:
+            if self._withdrawn_answer or self._answer_state is not state:
+                raise ValueError("This request is no longer the active question")
+            await self._answer_question(body)
+        future = asyncio.run_coroutine_threadsafe(submit(), self.loop)
+        def finished(result: ConcurrentFuture[Any]) -> None:
+            try:
+                result.result()
+            except Exception as exc:
+                queue_action(lambda exc=exc: self._show_session_error(str(exc)))
+        future.add_done_callback(finished)
+
+    def pending_snapshot(self) -> list[dict[str, Any]]:
+        from copy import deepcopy
+        return deepcopy(self._pending_rows)
+
+    def open_pending(self) -> None:
+        from visidata import vd
+        if self.pending_sheet is None:
+            self.pending_sheet = make_pending_sheet(self)
+        self.pending_sheet.rows = self.pending_snapshot()
+        vd.push(self.pending_sheet)
+
+    def open_plan(self) -> None:
+        from visidata import vd
+        if self.plan_sheet is None:
+            self.plan_sheet = make_plan_sheet(self)
+        self.plan_sheet.rows = self.store.plan_snapshot()
+        vd.push(self.plan_sheet)
+
+    def open_plan_history(self, row: dict[str, Any] | None) -> None:
+        from visidata import vd
+        vd.push(make_plan_sheet(self, self.store.plan_snapshot(int((row or {}).get("turn", 0)))))
+
+    def open_terminals(self) -> None:
+        from visidata import vd
+        if self.terminals_sheet is None:
+            self.terminals_sheet = make_terminals_sheet(self)
+        self.terminals_sheet.rows = self.store.terminals_snapshot()
+        vd.push(self.terminals_sheet)
+
+    def open_terminal_output(self, terminal_id: str) -> None:
+        from visidata import vd, TextSheet
+        row = next((r for r in self.store.terminals_snapshot() if r['terminal_id'] == terminal_id), None)
+        if row is None:
+            return
+        self.terminal_output_sheet = TextSheet('ACP terminal output', source=row['text'].splitlines())
+        self.terminal_output_sheet.jusi_acp_terminal = terminal_id
+        self.terminal_output_sheet.runtime = self
+        self.terminal_output_sheet.options.wrap = True
+        vd.push(self.terminal_output_sheet)
+        self._refresh()
 
     def _close_questions_sheet(self) -> None:
         if self.questions_sheet is not None:
@@ -864,6 +1096,9 @@ class ACPApplication:
     def _completion_items(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         prefix = str(payload.get("prefix", ""))
         cursor = int(payload.get("cursor_pos", len(prefix)))
+        paths = self.path_completer.complete(prefix, cursor)
+        if paths is not None:
+            return paths
         state = self._answer_state
         if state is not None:
             choices = [(str(option.get("label", "")), str(option.get("description", "")))
@@ -876,7 +1111,8 @@ class ACPApplication:
         if start < 0 or (start > 0 and not prefix[start - 1].isspace()):
             return []
         typed = prefix[start + 1:]
-        commands = [("cancel", "Cancel the active ACP turn")]
+        commands = [("cancel", "Cancel the active ACP turn"), ("plan", "Show the current session plan"),
+                    ("terminals", "Monitor client-owned terminals"), ("pending", "Show pending requests")]
         if self.initialize_response is not None:
             caps = getattr(self.initialize_response, "agent_capabilities", None)
             session_caps = caps.session_capabilities if caps else None
@@ -901,8 +1137,12 @@ class ACPApplication:
         label = ""
         if status is not None:
             label = f"exit {status.exit_code}" if status.exit_code is not None else f"signal {status.signal}"
-        self.store.update_terminal(terminal_id, output, truncated, label or "running")
-        self._refresh(follow_tail=True)
+        store = self._terminal_stores.get(terminal_id, self.store)
+        if store.session_id == self.session_id:
+            store = self.store
+        store.update_terminal(terminal_id, output, truncated, label or "running")
+        if store is self.store:
+            self._refresh(follow_tail=True)
 
     def _refresh(self, *, follow_tail: bool = False) -> None:
         with self._refresh_lock:
@@ -932,7 +1172,7 @@ class ACPApplication:
         if self._session_loading:
             return
         if self.turns_sheet is not None:
-            self.turns_sheet.rows = self.store.turns_snapshot()
+            self.turns_sheet.rows = self.store.timeline_snapshot()
             self.turns_sheet.recalc()
         if self.live_sheet is not None:
             should_follow_tail = follow_tail and self._live_sheet_should_follow_tail()
@@ -944,6 +1184,37 @@ class ACPApplication:
             self.live_sheet.recalc()
             if should_follow_tail:
                 self.live_sheet.cursorRowIndex = max(0, len(self.live_sheet.rows) - 1)
+        from visidata import vd
+        for sheet in list(vd.sheets):
+            if getattr(sheet, "runtime", None) is not self or sheet is self.live_sheet:
+                continue
+            if hasattr(sheet, "jusi_acp_activity"):
+                sheet.rows = self.store.activity_snapshot(sheet.jusi_acp_activity)
+                sheet.recalc()
+            elif hasattr(sheet, "jusi_acp_turn") and sheet is not self.reply_sheet:
+                sheet.rows = self.store.turn_events_snapshot(sheet.jusi_acp_turn)
+                sheet.recalc()
+        for sheet, rows in ((self.plan_sheet, self.store.plan_snapshot()),
+                            (self.terminals_sheet, self.store.terminals_snapshot()),
+                            (self.pending_sheet, self.pending_snapshot())):
+            if sheet is not None:
+                sheet.rows = rows
+                sheet.recalc()
+        if self.terminal_output_sheet is not None:
+            sheet = self.terminal_output_sheet
+            row = next((r for r in self.store.terminals_snapshot()
+                        if r['terminal_id'] == sheet.jusi_acp_terminal), None)
+            if row is not None:
+                lines = row['text'].splitlines() or ['']
+                follow = sheet.cursorRowIndex >= len(sheet.rows) - 1
+                if getattr(sheet, '_output_text', None) != row['text']:
+                    sheet._output_text = row['text']
+                    sheet.source = lines
+                    sheet.rows = list(sheet.readlines(lines))
+                    sheet.recalc()
+                    if follow:
+                        sheet.cursorRowIndex = max(0, len(sheet.rows) - 1)
+                sheet.name = 'ACP terminal · ' + row['status'] + (' · truncated' if row['raw']['truncated'] else '')
         with self._refresh_lock:
             dirty = self._refresh_dirty
         if dirty:
@@ -963,6 +1234,10 @@ class ACPApplication:
 
     def _show_live_turn(self, turn_number: int) -> None:
         from visidata import vd
+        self._dismiss_reply()
+        self._deferred_reply = None
+        if self.live_sheet is not None and self.live_sheet in vd.sheets:
+            vd.remove(self.live_sheet)
         self.live_sheet = make_events_sheet(
             self,
             self.store.turn_events_snapshot(turn_number),
@@ -971,14 +1246,52 @@ class ACPApplication:
         self.live_sheet.jusi_acp_turn = turn_number
         self.sheet = self.live_sheet
         vd.push(self.live_sheet)
+        if self._answer_state is not None:
+            self.reopen_question()
+
+    def _dismiss_reply(self) -> None:
+        from visidata import vd
+        if self.reply_sheet is not None and self.reply_sheet in vd.sheets:
+            vd.remove(self.reply_sheet)
+        self.reply_sheet = None
+
+    def _show_completed_turn(self, turn_number: int) -> None:
+        from visidata import vd, TextSheet
+        if self.store.active_turn is not None:
+            return
+        if self._answer_state is not None or self._withdrawn_answer:
+            self._deferred_reply = turn_number
+            return
+        if self.turns_sheet is None:
+            return
+        self._dismiss_reply()
+        if self.live_sheet is not None and self.live_sheet in vd.sheets:
+            vd.remove(self.live_sheet)
+        self.live_sheet = None
+        self._focus_turns_sheet()
+        for index, row in enumerate(self.turns_sheet.rows):
+            if row.get('turn') == turn_number:
+                self.turns_sheet.cursorRowIndex = index
+                reply = row.get('reply', '')
+                if reply:
+                    self.reply_sheet = TextSheet(f'ACP turn {turn_number} reply', source=reply.splitlines())
+                    self.reply_sheet.options.wrap = True
+                    self.reply_sheet.runtime = self
+                    self.reply_sheet.addCommand('d', 'jusi-acp-reply-diffs',
+                        f'sheet.runtime.open_turn_diffs({{"turn": {turn_number}}})', 'show changes in this turn')
+                    from .ui import session_commands
+                    vd.push(session_commands(self.reply_sheet))
+                break
 
     def _focus_turns_sheet(self) -> None:
         if self.turns_sheet is None:
             return
         from visidata import vd
-        self.turns_sheet.rows = self.store.turns_snapshot()
+        self.turns_sheet.rows = self.store.timeline_snapshot()
         self.turns_sheet.recalc()
         vd.push(self.turns_sheet)
+        if self._answer_state is not None or self._withdrawn_answer:
+            self.reopen_question()
 
     def _handle_asyncio_exception(
         self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]
@@ -1138,15 +1451,13 @@ def run_application(payload_path: Path, socket_path: str) -> int:
     install_api()
     vd._jusi_acp_runtime = runtime
     runtime.turns_sheet = make_turns_sheet(runtime)
-    runtime.live_sheet = make_events_sheet(runtime, [], name=f"acp:{runtime.alias}:session")
-    runtime.live_sheet.jusi_acp_raw = True
-    runtime.sheet = runtime.live_sheet
+    runtime.sheet = runtime.turns_sheet
     queue_action(runtime.start)
     root_logger = logging.getLogger()
     previous_handlers = root_logger.handlers[:]
     root_logger.handlers = [_ApplicationLogHandler(runtime)]
     try:
-        vd.run(runtime.turns_sheet, runtime.live_sheet)
+        vd.run(runtime.turns_sheet)
     finally:
         runtime.close()
         root_logger.handlers = previous_handlers

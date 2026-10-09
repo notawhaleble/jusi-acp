@@ -9,7 +9,7 @@ import sys
 import pytest
 
 
-def test_questions_follow_the_real_jusi_notebook_ux(tmp_path):
+def _run_notebook_fixture(tmp_path, script_name):
     root = Path(__file__).resolve().parents[1]
     frontend = Path(os.environ.get("JUSI_NVIM_ROOT", str(root.parent / "jusi")))
     nvim = shutil.which("nvim")
@@ -32,13 +32,18 @@ def test_questions_follow_the_real_jusi_notebook_ux(tmp_path):
                JUSI_TEST_PYTHON=sys.executable, JUSI_TEST_RESULT=str(result_path),
                TERM="xterm-256color")
     run = subprocess.run([nvim, "--headless", "-i", "NONE", "-u", "NONE", "-l",
-                          str(fixture_root / "followup_questions.lua")],
+                          str(fixture_root / script_name)],
                          env=env, cwd=tmp_path, capture_output=True, text=True, timeout=100)
     assert run.returncode == 0, run.stderr
     result = json.loads(result_path.read_text())
-    assert result["ok"], result.get("failure", "") + "\n" + result.get("stderr", "")
+    assert result["ok"], result.get("failure", "") + "\n" + result.get("stderr", "") + "\n" + result.get("screen", "")
     events = [json.loads(line) for path in (tmp_path / "state").rglob("events.jsonl")
               for line in path.read_text().splitlines()]
+    return result, events
+
+
+def test_questions_follow_the_real_jusi_notebook_ux(tmp_path):
+    result, events = _run_notebook_fixture(tmp_path, "followup_questions.lua")
     prompts = [row["text"] for row in events if row["type"] == "user_prompt"]
     assert [body.strip() for body in prompts if body.strip() != "fresh-cell-only"] == [
         "questions-many", "questions", "questions-wait", "healthy", "diff",
@@ -52,3 +57,11 @@ def test_questions_follow_the_real_jusi_notebook_ux(tmp_path):
     returned = json.loads(next(text for text in replies if text.startswith("ANSWERS:")).removeprefix("ANSWERS:"))
     assert returned == {"0": answers[0], "1": answers[1]}
     assert all(answer in result["history"] for answer in answers[:2]), result["history"]
+
+
+def test_session_features_through_real_notebook_and_terminal(tmp_path):
+    (tmp_path / "sample.py").write_text("print('sample')\n")
+    result, events = _run_notebook_fixture(tmp_path, "session_features.lua")
+    assert result["completion_followup"]
+    assert result["form"] and result["terminal"] and result["plan"] and result["url"]
+    assert not any(row["type"] == "user_prompt" and "sample" in row["text"] for row in events)

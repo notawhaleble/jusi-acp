@@ -31,6 +31,10 @@ class EventStore:
     session_id: str = ""
     rows: list[dict[str, Any]] = field(default_factory=list)
     turns: list[dict[str, Any]] = field(default_factory=list)
+    timeline: list[dict[str, Any]] = field(default_factory=list)
+    plan: list[dict[str, Any]] = field(default_factory=list)
+    plan_history: list[dict[str, Any]] = field(default_factory=list)
+    _owners: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict, repr=False)
     _lock: Lock = field(default_factory=Lock, repr=False)
     _active_turn: dict[str, Any] | None = field(default=None, init=False, repr=False)
     persist: bool = field(default=True, repr=False)
@@ -42,6 +46,7 @@ class EventStore:
             if rebinding_session:
                 self.rows.clear()
                 self.turns.clear()
+                self._reset_projection()
                 self._active_turn = None
         if not load_cache:
             return
@@ -61,6 +66,7 @@ class EventStore:
         with self._lock:
             self.rows[:] = cached
             self.turns.clear()
+            self._reset_projection()
             self._active_turn = None
             for row in cached:
                 self._project(row)
@@ -76,6 +82,7 @@ class EventStore:
             "status": str(raw.get("status", raw.get("stopReason", "")) or ""),
             "text": _text(raw),
             "tool_call_id": str(raw.get("toolCallId", "") or ""),
+            "message_id": str(raw.get("messageId", "") or ""),
             "tool": str((raw.get("_meta") or {}).get("toolName", raw.get("name", raw.get("kind", "")))) if kind in {"tool_call", "tool_call_update"} else "",
             "command": _command(raw),
             "input": _display_value(raw.get("rawInput")),
@@ -118,7 +125,7 @@ class EventStore:
         }
         with self._lock:
             existing = next(
-                (item for item in reversed(self.rows) if item.get("terminal_id") == terminal_id),
+                (item for item in reversed(self.rows) if item.get("type") == "terminal" and item.get("terminal_id") == terminal_id),
                 None,
             )
             if existing is None:
@@ -129,7 +136,7 @@ class EventStore:
                     row["raw"]["command"] = row["command"]
                 existing.update(row)
             self._project(row)
-        if status != "running":
+        if existing is None or status != "running":
             self._append(row)
 
     @property
@@ -164,6 +171,47 @@ class EventStore:
         with self._lock:
             turn = next((item for item in self.turns if item.get("turn") == turn_number), None)
             return deepcopy(_aggregate_diffs(turn.get("raw_events", []))) if turn is not None else []
+
+    def _reset_projection(self) -> None:
+        self.timeline.clear()
+        self.plan.clear()
+        self.plan_history.clear()
+        self._owners.clear()
+
+    def timeline_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [deepcopy({k: v for k, v in item.items() if k not in {"events", "raw_events"}})
+                    | {"changes": len({d["path"] for d in _aggregate_diffs(item["raw_events"])})}
+                    for item in self.timeline]
+
+    def activity_snapshot(self, activity_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            return deepcopy(next((item["events"] for item in self.timeline
+                                  if item.get("activity_id") == activity_id), []))
+
+    def plan_snapshot(self, turn_number: int | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if turn_number is None:
+                return deepcopy(self.plan)
+            return deepcopy([revision for revision in self.plan_history
+                             if revision.get("turn") == turn_number])
+
+    def terminals_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return deepcopy(list({row["terminal_id"]: row for row in self.rows if row["type"] == "terminal"}.values()))
+
+    def mark_read(self, turn_number: int) -> None:
+        with self._lock:
+            for turn in self.turns:
+                if turn["turn"] == turn_number:
+                    turn["updates"] = 0
+
+    def _owner(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        for key in ("tool_call_id", "terminal_id", "message_id"):
+            value = row.get(key)
+            if value and (key, value) in self._owners:
+                return self._owners[key, value]
+        return None
 
     def finish_replay(self) -> None:
         """Close the final history turn after session/load finishes replaying it."""
@@ -209,20 +257,42 @@ class EventStore:
                 "events": [],
                 "raw_events": [deepcopy(row)],
             }
+            turn["updates"] = 0
             self.turns.append(turn)
+            self.timeline.append(turn)
             self._active_turn = turn
             turn["events"].append(_presentation_row(
                 row, group="user" if kind == "user_message_chunk" else ""
             ))
             return
-        turn = self._active_turn
-        # Some agents deliver the final context snapshot after the prompt reply.
+        raw = row.get("raw", {})
+        turn = self._owner(row)
+        if turn is None:
+            turn = self._active_turn
+        # Context usage is session-wide; retain the last snapshot on the last
+        # prompt for compatibility, without treating it as an assistant message.
         if turn is None and kind == "usage_update" and self.turns:
             turn = self.turns[-1]
         if turn is None:
-            return
+            if self.timeline and self.timeline[-1].get("activity_id"):
+                turn = self.timeline[-1]
+            else:
+                turn = {"activity_id": len(self.timeline) + 1, "time": row.get("time", ""),
+                        "prompt": "Unassigned session activity", "reply": "", "status": "session",
+                        "events": [], "raw_events": [], "updates": 0}
+                self.timeline.append(turn)
+        for key in ("tool_call_id", "terminal_id", "message_id"):
+            if row.get(key):
+                self._owners.setdefault((key, row[key]), turn)
+        if turn is not self._active_turn and kind not in {"usage_update", "turn_stopped"}:
+            turn["updates"] += 1
+        if kind == "plan":
+            self.plan = deepcopy(raw.get("entries", []))
+            self.plan_history.append({"revision": len(self.plan_history) + 1,
+                                      "time": row.get("time", ""), "turn": turn.get("turn"),
+                                      "entries": deepcopy(self.plan)})
+            row["plan_revision"] = len(self.plan_history)
         turn["raw_events"].append(deepcopy(row))
-        raw = row.get("raw", {})
         if kind == "usage_update":
             turn["context_usage"] = deepcopy(raw)
             turn["context_used"] = raw.get("used")
@@ -232,7 +302,7 @@ class EventStore:
             if isinstance(cost := raw.get("cost"), dict):
                 turn["session_cost"] = cost.get("amount")
                 turn["currency"] = cost.get("currency")
-        if kind in {"question_waiting", "questions_resumed"}:
+        if kind in {"question_waiting", "questions_resumed"} and turn is self._active_turn:
             turn["status"] = row.get("status", "running")
         if kind == "config_option_update":
             for option in row.get("raw", {}).get("configOptions", []):
@@ -421,7 +491,15 @@ def _message_group(kind: str) -> str:
 def _merge_presentation_row(events: list[dict[str, Any]], row: dict[str, Any]) -> None:
     kind = str(row.get("type", ""))
     group = _message_group(kind)
-    if group and events and events[-1].get("group") == group:
+    if group and row.get("message_id"):
+        existing = next((event for event in events if event.get("group") == group
+                         and event.get("message_id") == row["message_id"]), None)
+        if existing is not None:
+            existing["text"] += str(row.get("text", ""))
+            existing["time"] = row.get("time", "")
+            return
+    if (group and events and events[-1].get("group") == group
+            and events[-1].get("message_id", "") == row.get("message_id", "")):
         events[-1]["text"] = str(events[-1].get("text", "")) + str(row.get("text", ""))
         events[-1]["time"] = row.get("time", events[-1].get("time", ""))
         return
@@ -439,9 +517,9 @@ def _merge_presentation_row(events: list[dict[str, Any]], row: dict[str, Any]) -
         group = "tool"
 
     terminal_id = str(row.get("terminal_id", "") or "")
-    if terminal_id:
+    if terminal_id and kind == "terminal":
         existing = next(
-            (event for event in reversed(events) if event.get("terminal_id") == terminal_id),
+            (event for event in reversed(events) if event.get("type") == "terminal" and event.get("terminal_id") == terminal_id),
             None,
         )
         if existing is not None:
@@ -454,7 +532,7 @@ def _merge_presentation_row(events: list[dict[str, Any]], row: dict[str, Any]) -
 
 
 def _update_projected_row(existing: dict[str, Any], row: dict[str, Any]) -> None:
-    for key in ("time", "type", "title", "status", "text", "tool", "command", "input"):
+    for key in ("time", "type", "title", "status", "text", "tool", "command", "input", "terminal_id"):
         value = row.get(key)
         if value not in (None, ""):
             existing[key] = value

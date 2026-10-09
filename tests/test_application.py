@@ -139,14 +139,14 @@ def test_agent_capabilities_control_optional_family_commands(tmp_path: Path) -> 
     app = ACPApplication(_payload(tmp_path))
     assert [item["text"] for item in app.handle_operation(
         "complete", {"prefix": "/", "cursor_pos": 1}
-    )["items"]] == ["/cancel"]
+    )["items"]] == ["/cancel", "/plan", "/terminals", "/pending"]
     app.session_modes = SimpleNamespace()
     app.config_options = [SimpleNamespace(id="model")]
     app.initialize_response = SimpleNamespace(auth_methods=[SimpleNamespace(id="login")])
     texts = [item["text"] for item in app.handle_operation(
         "complete", {"prefix": "/", "cursor_pos": 1}
     )["items"]]
-    assert texts == ["/cancel", "/mode", "/config", "/auth"]
+    assert texts == ["/cancel", "/plan", "/terminals", "/pending", "/mode", "/config", "/auth"]
 
 
 def test_available_command_completion_includes_standard_input_hint(tmp_path: Path) -> None:
@@ -600,7 +600,7 @@ def test_interrupt_before_answer_submission_does_not_answer_question(tmp_path, m
         app.close()
 
 
-def test_finished_turn_cancels_outstanding_question_target(tmp_path, monkeypatch):
+def test_finished_turn_keeps_outstanding_session_question_answerable(tmp_path, monkeypatch):
     from acp.schema import PermissionOption, ToolCallUpdate
     monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
     app = ACPApplication(_payload(tmp_path))
@@ -623,9 +623,12 @@ def test_finished_turn_cancels_outstanding_question_target(tmp_path, monkeypatch
         assert result["status"] == "awaiting_answer"
         finish.set()
         await app._turn_task
-        assert app._answer_state is None
+        assert app._answer_state is not None
+        assert not permission_task.done()
+        await app._prompt_or_command("Still answerable")
+        response = await permission_task
+        assert response.answers == {"0": "Still answerable"}
         assert not app._questions
-        assert (await permission_task).outcome.outcome == "cancelled"
     asyncio.run(run())
 
 

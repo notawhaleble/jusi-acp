@@ -9,6 +9,8 @@ from acp import PROTOCOL_VERSION, run_agent
 from acp.helpers import update_agent_message_text, update_user_message_text
 from acp.schema import (
     AgentCapabilities,
+    ElicitationFormSessionMode,
+    ElicitationUrlSessionMode,
     CurrentModeUpdate,
     Implementation,
     InitializeResponse,
@@ -27,6 +29,7 @@ class FakeAgent:
     def __init__(self) -> None:
         self.client = None
         self.cancelled = asyncio.Event()
+        self.background_tasks = set()
 
     def on_connect(self, client) -> None:  # type: ignore[no-untyped-def]
         self.client = client
@@ -82,6 +85,44 @@ class FakeAgent:
     async def prompt(self, session_id, prompt, **kwargs):  # type: ignore[no-untyped-def]
         _ = kwargs
         text = prompt[0].text.strip()
+        if text == "elicitation-form":
+            result = await self.client.create_elicitation("Configure the task", ElicitationFormSessionMode(
+                session_id=session_id, requested_schema={"type": "object", "properties": {
+                    "count": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "notes": {"type": "string"}}, "required": ["count", "notes"]}))
+            await self.client.session_update(session_id, update_agent_message_text(
+                "FORM:" + json.dumps(result.model_dump(mode="json", exclude_none=True), ensure_ascii=False)))
+            return PromptResponse(stop_reason="end_turn")
+        if text == "elicitation-url":
+            result = await self.client.create_elicitation("Open the example page", ElicitationUrlSessionMode(
+                session_id=session_id, elicitation_id="example", url="https://example.com/"))
+            if result.action == "accept":
+                await self.client.complete_elicitation("example")
+            await self.client.session_update(session_id, update_agent_message_text("URL:" + result.action))
+            return PromptResponse(stop_reason="end_turn")
+        if text == "background":
+            await self.client.session_update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "worker-bg",
+                "title": "Background worker", "kind": "other", "status": "in_progress"})
+            await self.client.session_update(session_id, {"sessionUpdate": "plan", "entries": [
+                {"content": "Background work", "priority": "medium", "status": "in_progress"}]})
+            async def background():
+                await asyncio.sleep(0.5)
+                await self.client.session_update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "worker-bg",
+                    "status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "Late worker result"}}]})
+                await self.client.session_update(session_id, update_agent_message_text("Unassigned background message"))
+                await self.client.session_update(session_id, {"sessionUpdate": "plan", "entries": [
+                    {"content": "Background work", "priority": "medium", "status": "completed"}]})
+                response = await self.client._conn.send_request("session/request_permission", {
+                    "sessionId": session_id, "toolCall": {"toolCallId": "worker-bg", "title": "Background question",
+                    "rawInput": {"questions": [{"question": "Background follow-up?", "options": []}]}},
+                    "options": [{"optionId": "yes", "name": "Answer", "kind": "allow_once"}]})
+                await self.client.session_update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "worker-bg",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "BG:" + json.dumps(response.get("answers"))}}]})
+            task = asyncio.create_task(background())
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+            await self.client.session_update(session_id, update_agent_message_text("Background started"))
+            return PromptResponse(stop_reason="end_turn")
         if text == "usage":
             await self.client.session_update(session_id, UsageUpdate(
                 session_update="usage_update", used=120, size=200000,

@@ -267,6 +267,19 @@ class EventStore:
             return
         raw = row.get("raw", {})
         turn = self._owner(row)
+        if kind == "prompt_suggestion" and self.turns:
+            # Qwen's suggestions can arrive after prompt() returns, even while
+            # another prompt runs. Its session-scoped counter identifies the
+            # originating prompt; keep this advisory text in that drill-down.
+            notification = raw.get("notification", {})
+            prompt_id = notification.get("promptId", "")
+            prefix = str(notification.get("sessionId", "")) + "########"
+            suffix = prompt_id[len(prefix):] if isinstance(prompt_id, str) and prompt_id.startswith(prefix) else ""
+            number = int(suffix) if suffix.isdecimal() else 0
+            if 0 < number <= len(self.turns):
+                turn = self.turns[number - 1]
+            else:
+                turn = self._active_turn or self.turns[-1]
         if turn is None:
             turn = self._active_turn
         # Context usage is session-wide; retain the last snapshot on the last

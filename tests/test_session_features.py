@@ -172,14 +172,14 @@ def test_path_completion_respects_gitignore_ranges_and_pending_answers(tmp_path)
     (tmp_path / 'src/α file.py').write_text('data')
     app = ACPApplication(_payload(tmp_path))
     app._answer_state = {'options': []}
-    prefix = 'Explain α\n@α'
+    prefix = 'Explain α\n@src/α'
     result = app.handle_operation('complete', {'prefix': prefix, 'cursor_pos': len(prefix), 'body': prefix + 'SUFFIX'})
     assert validate_completion(result, len(prefix)) == result
     item = result['items'][0]
-    assert item['text'] == './src/α\\ file.py'
-    assert prefix[:item['start']] + item['text'] + 'SUFFIX' == 'Explain α\n./src/α\\ file.pySUFFIX'
+    assert item['text'] == '@src/α\\ file.py'
+    assert prefix[:item['start']] + item['text'] + 'SUFFIX' == 'Explain α\n@src/α\\ file.pySUFFIX'
     assert not any('ignored' in item['text'] for item in app.handle_operation('complete', {'prefix': '@'})['items'])
-    assert app.path_completer.complete('@src/α\\ file.py', 15)[0]['text'] == './src/α\\ file.py'
+    assert app.path_completer.complete('@src/α\\ file.py', 15)[0]['text'] == '@src/α\\ file.py'
     assert app.path_completer.complete('email@example.com', 17) is None
     assert app.path_completer.complete('', 0) is None
     assert app.path_completer.complete('Look ./src/', 11)[0]['text'] == './src/α\\ file.py'

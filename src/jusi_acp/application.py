@@ -31,7 +31,8 @@ from acp.schema import (
 )
 
 from . import __version__
-from .compat import MODE_NOTIFICATIONS, PROMPT_SUGGESTION_NOTIFICATION, install_mode_notifications
+from .attention import AttentionPublisher, BackgroundTools
+from .compat import MODE_NOTIFICATIONS, MODEL_NOTIFICATION, PROMPT_SUGGESTION_NOTIFICATION, install_mode_notifications
 from .ipc import ApplicationController
 from .state import EventStore
 from .questions import QuestionRequest, question_text, form_questions, parse_form_answer
@@ -49,6 +50,7 @@ from .ui import (
     make_terminals_sheet,
     make_pending_sheet,
     make_sessions_sheet,
+    make_models_sheet,
     make_turns_sheet,
     queue_action,
 )
@@ -86,6 +88,8 @@ class ACPApplication:
             raise ValueError("mcp_servers must be an array")
 
         self.store = EventStore(self.plugin_id, self.cwd)
+        self.attention = AttentionPublisher()
+        self._background_tools = BackgroundTools()
         self.sheet: Any = None
         self.turns_sheet: Any = None
         self.live_sheet: Any = None
@@ -104,6 +108,8 @@ class ACPApplication:
         self.session_id = ""
         self._browse_sessions = False
         self._reported_model = ""
+        self._available_models: list[dict[str, Any]] = []
+        self._model_change_pending = False
         self._notification_frames: dict[str, Any] = {}
         self.session_modes: Any = None
         self._current_mode_id = ""
@@ -152,6 +158,11 @@ class ACPApplication:
                 self.session_modes.current_mode_id = current
         elif kind == "config_option_update":
             self.config_options = list(getattr(update, "config_options", []))
+        if not self._session_loading:
+            turn = self.store.active_turn
+            finished = self._background_tools.update(raw, int(turn["turn"]) if turn else None)
+            if finished:
+                self.attention.notice("Background tool finished" if finished == "completed" else "Background tool failed")
         self.store.add(update)
         self._refresh(follow_tail=True)
 
@@ -298,6 +309,22 @@ class ACPApplication:
             await self._mode_notification(params)
         elif method == PROMPT_SUGGESTION_NOTIFICATION:
             await self._prompt_suggestion_notification(params)
+        elif method == MODEL_NOTIFICATION:
+            await self._model_notification(params)
+
+    async def _model_notification(self, params: Any) -> None:
+        if not isinstance(params, dict) or params.get("v", 1) != 1:
+            raise RequestError.invalid_params({"details": "Expected a version 1 model notification"})
+        session_id, model_id = params.get("sessionId"), params.get("currentModelId")
+        if not isinstance(session_id, str) or not session_id or not isinstance(model_id, str) or not model_id:
+            raise RequestError.invalid_params({"details": "Model notification requires sessionId and currentModelId"})
+        if session_id != self.session_id:
+            return
+        self._reported_model = model_id
+        self.config_options = [option.model_copy(update={"current_value": model_id})
+                               if option.category == "model" or option.id == "model" else option
+                               for option in self.config_options]
+        self._refresh()
 
     async def _prompt_suggestion_notification(self, params: Any) -> None:
         if not isinstance(params, dict) or params.get("v", 1) != 1:
@@ -346,10 +373,14 @@ class ACPApplication:
             models = result.get("models")
             if isinstance(models, dict) and isinstance(models.get("currentModelId"), str):
                 self._reported_model = models["currentModelId"]
+                if isinstance(models.get("availableModels"), list):
+                    self._available_models = [model for model in models["availableModels"]
+                                              if isinstance(model, dict) and isinstance(model.get("modelId"), str)]
 
     def on_connect(self, connection: Any) -> None:
         install_mode_notifications(connection, self._mode_notification,
-                                   suggestion_handler=self._prompt_suggestion_notification)
+                                   suggestion_handler=self._prompt_suggestion_notification,
+                                   model_handler=self._model_notification)
         self.connection = connection
 
     # Application lifecycle ---------------------------------------------
@@ -468,7 +499,7 @@ class ACPApplication:
             raise ValueError("A session is loading; wait before submitting another operation")
         self._session_loading = True
         fields = ("store", "session_id", "session_modes", "_current_mode_id",
-                  "config_options", "available_commands", "_reported_model")
+                  "config_options", "available_commands", "_reported_model", "_available_models")
         previous = {name: getattr(self, name) for name in fields}
         self.store = EventStore(self.plugin_id, self.cwd, persist=False)
         if not previous["session_id"]:
@@ -481,9 +512,12 @@ class ACPApplication:
         self.config_options = []
         self.available_commands = []
         self._reported_model = ""
+        self._available_models = []
         try:
             await self._establish_session_inner()
             self.store.commit_replay()
+            self._background_tools = BackgroundTools()
+            self.attention.reset()
             if previous["session_id"] and previous["session_id"] != self.session_id:
                 await self._close_agent_session(previous["session_id"])
         except BaseException:
@@ -555,6 +589,8 @@ class ACPApplication:
         return rows
 
     async def _select_session(self, session_id: str) -> None:
+        if self._model_change_pending:
+            raise ValueError("Wait for model selection before switching sessions")
         if self._session_loading:
             raise ValueError("A session is loading; wait before selecting another session")
         if self._questions:
@@ -599,10 +635,10 @@ class ACPApplication:
     def _show_selected_session(self) -> None:
         from visidata import vd
         for sheet in list(vd.sheets):
-            if getattr(sheet, "runtime", None) is self and sheet is not self.turns_sheet:
+            if (getattr(sheet, "runtime", None) is self
+                    and sheet is not self.turns_sheet and sheet is not self.sessions_sheet):
                 vd.remove(sheet)
         self.live_sheet = None
-        self.sessions_sheet = None
         self.reply_sheet = self.plan_sheet = self.terminals_sheet = self.terminal_output_sheet = self.pending_sheet = None
         self._deferred_reply = None
         self._focus_turns_sheet()
@@ -673,6 +709,8 @@ class ACPApplication:
         return future.result()
 
     async def _prompt_or_command(self, body: str, *, initial: bool = False) -> dict[str, Any]:
+        if self._model_change_pending:
+            raise ValueError("Wait for model selection before submitting a follow-up")
         if self._session_loading:
             raise ValueError("A session is loading; wait before submitting a follow-up")
         stripped = body.strip()
@@ -712,6 +750,12 @@ class ACPApplication:
             return {"command": "sessions", "count": len(rows)}
         if self._turn_task is not None and not self._turn_task.done():
             raise ValueError("The ACP turn is still running; wait for a question or turn completion")
+        if stripped == "/model":
+            rows = self._model_rows()
+            if not rows:
+                raise ValueError("ACP agent does not advertise any selectable models")
+            queue_action(lambda rows=rows: self._push_models(rows))
+            return {"command": "model", "count": len(rows)}
         if stripped.startswith("/mode "):
             if self.session_modes is None:
                 raise ValueError("ACP agent does not advertise session modes")
@@ -781,6 +825,11 @@ class ACPApplication:
         with self._permission_lock:
             waiting = {key for key, (_, future) in self._permissions.items() if not future.done()}
         requests = [value for key, value in self._questions.items() if key in waiting]
+        self.attention.sync_requests({
+            request.request_id: ("Approval required" if request.kind == "permission" else
+                                 f"Answer required ({len(request.answers) + 1}/{len(request.questions)})")
+            for request in requests
+        })
         self._pending_rows = [dict(value.snapshot(), position=index + 1) for index, value in enumerate(requests)]
         request = requests[0] if requests else None
         state = request.snapshot() if request is not None else None
@@ -914,6 +963,8 @@ class ACPApplication:
                 if initial
                 else operation_cancel is not None and operation_cancel.is_set()
             ) or self._cancel_requested.is_set() or stop_reason in {"cancelled", "canceled"}
+            if turn is not None:
+                self._background_tools.finish_turn(int(turn["turn"]), cancelled=cancelled)
             if cancelled:
                 raise InterruptedError("ACP turn cancelled")
             return {"stop_reason": stop_reason, "session_id": self.session_id}
@@ -961,6 +1012,7 @@ class ACPApplication:
             loop.call_soon_threadsafe(shutdown.set)
         if self._thread is not None:
             self._thread.join(timeout=4)
+        self.attention.close()
 
     # UI and feedback ----------------------------------------------------
     def select_permission(self, request_id: str, option_id: str | dict[str, Any] | None) -> None:
@@ -981,6 +1033,71 @@ class ACPApplication:
         from visidata import vd
         self.sessions_sheet = make_sessions_sheet(self, rows)
         vd.push(self.sessions_sheet)
+
+    def _model_option(self) -> Any:
+        return next((option for option in self.config_options
+                     if option.category == "model" or option.id == "model"), None)
+
+    def _model_rows(self) -> list[dict[str, Any]]:
+        option = self._model_option()
+        choices = []
+        if option is not None:
+            for item in option.options:
+                for choice in getattr(item, "options", [item]):
+                    choices.append({"modelId": choice.value, "name": choice.name,
+                                    "description": choice.description or ""})
+        else:
+            choices = self._available_models
+        return [{"model_id": choice["modelId"], "name": choice.get("name", choice["modelId"]),
+                 "description": choice.get("description") or "",
+                 "current": "*" if choice["modelId"] == self._current_model() else ""}
+                for choice in choices]
+
+    async def _select_model(self, model_id: str, session_id: str) -> None:
+        if self._model_change_pending:
+            raise ValueError("A model selection is already in progress")
+        if session_id != self.session_id or self._session_loading:
+            raise ValueError("The session changed; reopen the model picker")
+        if self._questions or self._turn_task is not None and not self._turn_task.done():
+            raise ValueError("Wait for turn completion and answer pending requests before changing models")
+        if model_id not in {row["model_id"] for row in self._model_rows()}:
+            raise ValueError("The model list changed; reopen the model picker")
+        self._model_change_pending = True
+        try:
+            option = self._model_option()
+            if option is not None:
+                response = await self.connection.set_config_option(option.id, self.session_id, model_id)
+                self.config_options = list(response.config_options)
+            else:
+                # Published Python SDK dropped the legacy model API, but older
+                # v1 agents still advertise and implement it.
+                await self.connection._conn.send_request("session/set_model", {
+                    "sessionId": self.session_id, "modelId": model_id})
+                self._reported_model = model_id
+        finally:
+            self._model_change_pending = False
+        self._refresh()
+
+    def select_model(self, model_id: str, sheet: Any) -> None:
+        if self.loop is None or self.loop.is_closed():
+            return
+        future = asyncio.run_coroutine_threadsafe(self._select_model(model_id, sheet.session_id), self.loop)
+
+        def finished(result: ConcurrentFuture[Any]) -> None:
+            error = result.exception()
+            def show_result() -> None:
+                from visidata import vd
+                if error is not None:
+                    vd.error(f"Model selection failed: {error}")
+                else:
+                    vd.quit(sheet)
+                    vd.status(f"Model: {self._current_model()}")
+            queue_action(show_result)
+        future.add_done_callback(finished)
+
+    def _push_models(self, rows: list[dict[str, Any]]) -> None:
+        from visidata import vd
+        vd.push(make_models_sheet(self, rows))
 
     def _show_question(self, state: dict[str, Any]) -> None:
         if state is not self._answer_state or self._withdrawn_answer:

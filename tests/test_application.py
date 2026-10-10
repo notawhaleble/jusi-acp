@@ -729,3 +729,73 @@ def test_prompt_suggestion_router_scope_and_late_delivery(tmp_path, monkeypatch)
                 await router(name, params, notification)
             assert error.value.code == code
     asyncio.run(run())
+
+
+def test_model_picker_modern_configuration_and_no_prompt(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    actions = []
+    monkeypatch.setattr("jusi_acp.application.queue_action", actions.append)
+    payload = _payload(tmp_path)
+    payload["launch"]["environment"]["JUSI_FIXTURE_MODELS"] = "1"
+    app = ACPApplication(payload)
+    app.start()
+    try:
+        result = app.handle_operation("followup", {"body": "/model"})
+        assert result == {"command": "model", "count": 2}
+        assert app._model_rows()[0]["current"] == "*"
+        app._submit(app._select_model("fixture-beta", app.session_id))
+        assert app._current_model() == "fixture-beta"
+        assert app.store.turns_snapshot() == []
+        with pytest.raises(ValueError, match="session changed"):
+            app._submit(app._select_model("fixture-alpha", "stale-session"))
+        app.handle_operation("followup", {"body": "hello"})
+        assert app.store.turns_snapshot()[0]["model"] == "fixture-beta"
+    finally:
+        app.close()
+
+
+def test_model_picker_legacy_rpc_and_grouped_options(tmp_path):
+    from acp.schema import NewSessionResponse
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "fake-session"
+    app._observe_protocol(SimpleNamespace(direction="incoming", message={"result": {"models": {
+        "currentModelId": "one", "availableModels": [
+            {"modelId": "one", "name": "First"}, {"modelId": "two", "name": "Second"}]}}}))
+    requests = []
+    async def send_request(method, params):
+        requests.append((method, params))
+        return {}
+    app.connection = SimpleNamespace(_conn=SimpleNamespace(send_request=send_request))
+    asyncio.run(app._select_model("two", app.session_id))
+    assert requests == [("session/set_model", {"sessionId": "fake-session", "modelId": "two"})]
+    assert app._current_model() == "two"
+    response = NewSessionResponse(session_id="fake-session", config_options=[{
+        "id": "model", "category": "model", "name": "Model", "type": "select",
+        "currentValue": "grouped", "options": [{"group": "Provider", "name": "Provider", "options": [
+            {"value": "grouped", "name": "Grouped model"}]}]}])
+    app._capture_session_options(response)
+    assert app._model_rows() == [{"model_id": "grouped", "name": "Grouped model", "description": "", "current": "*"}]
+
+
+def test_qwen_model_notification_routes_and_updates_picker_without_turn(tmp_path, monkeypatch):
+    from acp.client.router import build_client_router
+    from acp.schema import NewSessionResponse
+    monkeypatch.setattr("jusi_acp.application.queue_action", lambda action: None)
+    app = ACPApplication(_payload(tmp_path))
+    app.session_id = "current"
+    app._capture_session_options(NewSessionResponse(session_id="current", config_options=[{
+        "id": "model", "category": "model", "name": "Model", "type": "select", "currentValue": "one",
+        "options": [{"value": "one", "name": "One"}, {"value": "two", "name": "Two"}]}]))
+    router = build_client_router(app)
+    app.on_connect(SimpleNamespace(_conn=SimpleNamespace(_handler=router)))
+    async def run():
+        method = "qwen/notify/session/model-update"
+        await router(method, {"v": 1, "sessionId": "other", "currentModelId": "two"}, True)
+        assert app._current_model() == "one"
+        await router(method, {"v": 1, "sessionId": "current", "currentModelId": "two"}, True)
+        assert app._current_model() == "two"
+        assert app._model_rows()[1]["current"] == "*"
+        assert app.store.timeline_snapshot() == []
+        with pytest.raises(Exception):
+            await router(method, {"v": 2}, True)
+    asyncio.run(run())

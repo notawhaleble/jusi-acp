@@ -21,6 +21,13 @@ local ok, failure = xpcall(function()
     return jusi._sessions[buf] and jusi._sessions[buf].controller.transport_state == "connected"
   end, "service did not connect")
   local session = jusi._sessions[buf]
+  local function attention(kind)
+    local items = {}
+    for _, item in pairs(session.attention.items) do
+      if not kind or item.kind == kind then table.insert(items, item) end
+    end
+    return items
+  end
   jusi.start_kernel(buf)
   wait_for(function() return session.controller.kernel_state == "on" end, "kernel did not start")
   local function complete_path(row)
@@ -32,11 +39,11 @@ local ok, failure = xpcall(function()
         assert(vim.fn.pumvisible() == 1, "no native popup")
         local selected
         for index, item in ipairs(completion._active[buf].items) do
-          if item.text == "./sample.py" then selected = index end
+          if item.text == "@sample.py" then selected = index end
         end
         assert(selected, vim.inspect(completion._active[buf].items))
         vim.api.nvim_select_popupmenu_item(selected - 1, true, false, {})
-        assert(vim.api.nvim_buf_get_lines(buf, row-1, row, false)[1] == "./sample.pySUFFIX")
+        assert(vim.api.nvim_buf_get_lines(buf, row-1, row, false)[1] == "@sample.pySUFFIX")
       end, debug.traceback)
     end
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(
@@ -68,16 +75,34 @@ local ok, failure = xpcall(function()
     return response
   end
   wait_for(function() return screen():find("count", 1, true) and screen():find("Configure", 1, true) end, "no form")
+  wait_for(function() return #attention("action_required") == 1 end, "form did not request attention")
+  local form_attention_id = attention("action_required")[1].attention_id
+  assert(vim.api.nvim_get_current_buf() == buf, "attention stole notebook focus")
+  vim.fn.chansend(surface.job_id, "q")
+  wait_for(function() return not screen():find("field%s+│ value") end, "form did not close")
+  assert(#attention("action_required") == 1, "closing form cleared attention")
+  vim.fn.chansend(surface.job_id, "a")
+  wait_for(function() return screen():find("field%s+│ value") end, "form did not reopen")
   vim.fn.chansend(surface.job_id, "e2\r")
   vim.wait(100)
   vim.fn.chansend(surface.job_id, "\r")
   wait_for(function() return screen():find("notes", 1, true) end, "cell edit did not advance form")
+  wait_for(function()
+    local items = attention("action_required")
+    return #items == 1 and items[1].attention_id == form_attention_id and items[1].message == "Answer required (2/2)"
+  end, "form progress did not update existing attention")
   followup({"  Long answer", "α"})
   wait_for(function() return screen():find("FORM:", 1, true) end, "no form reply")
+  wait_for(function() return #attention() == 0 end, "answered form left attention pending")
   result.form = true
   local row = edit_body({"@samSUFFIX"})
   complete_path(row)
   result.completion_followup = true
+  followup({"/model"})
+  wait_for(function() return screen():find("Alpha model", 1, true) and screen():find("Beta model", 1, true) end, "no model picker")
+  vim.fn.chansend(surface.job_id, "j\r")
+  wait_for(function() return screen():find("Model: fixture-beta", 1, true) end, "model selection failed")
+  result.model = true
   followup({"terminal"})
   wait_for(function() return screen():find("terminal-ok:0", 1, true) end, "no terminal reply")
   followup({"/terminals"})
@@ -85,12 +110,30 @@ local ok, failure = xpcall(function()
   vim.fn.chansend(surface.job_id, "\r")
   wait_for(function() return screen():find("exit 0", 1, true) and screen():find("terminal-ok", 1, true) end, "no terminal output")
   result.terminal = true
+  assert(#attention() == 0, "ordinary turns or foreground terminal produced attention")
   followup({"background"})
   wait_for(function() return screen():find("Background follow-up?", 1, true) end, "idle background question missing")
+  wait_for(function() return #attention("notice") == 1 and #attention("action_required") == 1 end,
+           "background completion or question attention missing")
+  assert(attention("notice")[1].message == "Background tool finished")
+  assert(vim.api.nvim_get_current_buf() == buf, "background attention stole focus")
+  vim.cmd("JusiAttention!")
+  wait_for(function() return #attention("notice") == 0 end, "completion notice did not dismiss")
+  assert(#attention("action_required") == 1, "dismissal cleared unanswered question")
   followup({"Proceed"})
+  wait_for(function() return #attention() == 0 end, "background answer left attention pending")
+  result.attention = true
   followup({"/plan"})
   wait_for(function() return screen():find("Background work", 1, true) and screen():find("completed", 1, true) end, "late plan not visible")
   result.plan = true
+  followup({"background-metadata"})
+  wait_for(function() return #attention("notice") == 2 end, "metadata background completions did not notify")
+  vim.wait(300)
+  assert(#attention("notice") == 2, "duplicate background metadata produced extra notices")
+  assert(vim.api.nvim_get_current_buf() == buf, "metadata background notices stole focus")
+  vim.cmd("JusiAttention!")
+  wait_for(function() return #attention() == 0 end, "metadata completion notices did not dismiss")
+  result.metadata_attention = true
   followup({"elicitation-url"})
   wait_for(function() return screen():find("https://example.com/", 1, true) end, "URL request not visible")
   vim.fn.chansend(surface.job_id, "\r")

@@ -12,11 +12,13 @@ MODE_NOTIFICATIONS = frozenset({
     "quen/notify/session/mode-update",
 })
 PROMPT_SUGGESTION_NOTIFICATION = "qwen/notify/session/prompt-suggestion"
+MODEL_NOTIFICATION = "qwen/notify/session/model-update"
 
 
 def install_mode_notifications(
     connection: Any, handler: Callable[[Any], Awaitable[None]], *,
     suggestion_handler: Callable[[Any], Awaitable[None]] | None = None,
+    model_handler: Callable[[Any], Awaitable[None]] | None = None,
 ) -> None:
     # The SDK only forwards underscore-prefixed names to ext_notification.
     # It exposes no registration hook on ClientSideConnection in 0.12, so keep
@@ -30,3 +32,5 @@ def install_mode_notifications(
     if suggestion_handler is not None:
         router.add_route(Route(method=PROMPT_SUGGESTION_NOTIFICATION,
                                func=suggestion_handler, kind="notification"))
+    if model_handler is not None:
+        router.add_route(Route(method=MODEL_NOTIFICATION, func=model_handler, kind="notification"))

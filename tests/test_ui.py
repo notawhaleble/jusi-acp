@@ -74,9 +74,20 @@ local streamed = vim.wait(10000, function() return screen():find(BROWSE and "old
 local stream_screen = screen()
 local stopped = vim.wait(10000, function() return screen():find("ACP turn", 1, true) ~= nil end, 50)
 local turn_screen = screen()
+local returned, reopened = false, false
+local sessions_screen, reopened_screen = "", ""
+if BROWSE then
+  vim.fn.chansend(job, "q")
+  returned = vim.wait(5000, function() return screen():find("Previous work", 1, true) ~= nil end, 50)
+  sessions_screen = screen()
+  vim.fn.chansend(job, string.char(13))
+  reopened = vim.wait(10000, function() return screen():find("old prompt", 1, true) ~= nil end, 50)
+  reopened_screen = screen()
+end
 pcall(vim.fn.chansend, job, string.char(5))
 local error_seen = vim.wait(5000, function() return screen():find("RequestError") ~= nil end, 50)
 vim.fn.writefile({vim.json.encode({streamed=streamed, stopped=stopped, error_seen=error_seen,
+    returned=returned, reopened=reopened, sessions_screen=sessions_screen, reopened_screen=reopened_screen,
     stream_screen=stream_screen, turn_screen=turn_screen, error_screen=screen()})}, RESULT)
 vim.fn.jobstop(job)
 vim.cmd("qa!")
@@ -89,6 +100,9 @@ vim.cmd("qa!")
     screen = json.loads(result_path.read_text())
     assert screen["streamed"], screen["stream_screen"]
     assert screen["stopped"], screen["turn_screen"]
+    if body == "/sessions":
+        assert screen["returned"], screen["sessions_screen"]
+        assert screen["reopened"], screen["reopened_screen"]
     assert "Traceback (most recent call last)" not in screen["stream_screen"]
     assert "Traceback (most recent call last)" not in screen["turn_screen"]
     assert not screen["error_seen"], screen["error_screen"]

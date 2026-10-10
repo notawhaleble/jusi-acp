@@ -30,6 +30,18 @@ class FakeAgent:
         self.client = None
         self.cancelled = asyncio.Event()
         self.background_tasks = set()
+        self.model = "fixture-alpha"
+
+    def config_options(self):
+        return [{"id": "model", "category": "model", "name": "Model", "type": "select",
+                 "currentValue": self.model, "options": [
+                     {"value": "fixture-alpha", "name": "Alpha model"},
+                     {"value": "fixture-beta", "name": "Beta model"}]}]
+
+    async def set_config_option(self, config_id, session_id, value, **kwargs):
+        assert config_id == "model" and value in {"fixture-alpha", "fixture-beta"}
+        self.model = value
+        return {"configOptions": self.config_options()}
 
     def on_connect(self, client) -> None:  # type: ignore[no-untyped-def]
         self.client = client
@@ -56,10 +68,12 @@ class FakeAgent:
 
     async def new_session(self, cwd, additional_directories=None, mcp_servers=None, **kwargs):  # type: ignore[no-untyped-def]
         _ = cwd, additional_directories, mcp_servers, kwargs
+        session_id = "fake-session"
         if os.environ.get("JUSI_FIXTURE_UNIQUE_SESSIONS"):
             from uuid import uuid4
-            return NewSessionResponse(session_id=uuid4().hex)
-        return NewSessionResponse(session_id="fake-session")
+            session_id = uuid4().hex
+        return NewSessionResponse(session_id=session_id, config_options=(
+            self.config_options() if os.environ.get("JUSI_FIXTURE_MODELS") else None))
 
     async def list_sessions(self, cwd=None, cursor=None, **kwargs):  # type: ignore[no-untyped-def]
         _ = cursor, kwargs
@@ -100,6 +114,33 @@ class FakeAgent:
                 await self.client.complete_elicitation("example")
             await self.client.session_update(session_id, update_agent_message_text("URL:" + result.action))
             return PromptResponse(stop_reason="end_turn")
+        if text == "background-metadata":
+            # Qwen completes the launch tool, then sends two metadata-bearing
+            # messages for each finished task in later background activity.
+            for index in range(2):
+                await self.client.session_update(session_id, {
+                    "sessionUpdate": "tool_call", "toolCallId": f"metadata-launch-{index}",
+                    "title": "Launch background agent", "status": "in_progress", "kind": "other"})
+                await self.client.session_update(session_id, {
+                    "sessionUpdate": "tool_call_update", "toolCallId": f"metadata-launch-{index}",
+                    "status": "completed", "rawOutput": {"executionMode": "background", "status": "background"}})
+
+            async def metadata_background():
+                await asyncio.sleep(0.5)
+                await self.client.session_update(session_id, update_agent_message_text("Background agent completed."))
+                for index in range(2):
+                    for source in ("background_task_completed", "background_notification"):
+                        await self.client.session_update(session_id, {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "Background agent completed."},
+                            "_meta": {"source": source, "qwenDiscreteMessage": True, "backgroundTask": {
+                                "taskId": f"metadata-task-{index}", "toolUseId": f"metadata-launch-{index}",
+                                "sourceTurnId": session_id + "########1", "status": "completed", "kind": "agent"}}})
+            task = asyncio.create_task(metadata_background())
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+            await self.client.session_update(session_id, update_agent_message_text("Background agents started"))
+            return PromptResponse(stop_reason="end_turn")
         if text == "background":
             await self.client.session_update(session_id, {"sessionUpdate": "tool_call", "toolCallId": "worker-bg",
                 "title": "Background worker", "kind": "other", "status": "in_progress"})
@@ -109,6 +150,12 @@ class FakeAgent:
                 await asyncio.sleep(0.5)
                 await self.client.session_update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "worker-bg",
                     "status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "Late worker result"}}]})
+                for source in ("background_task_completed", "background_notification"):
+                    await self.client.session_update(session_id, {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "Background worker completed."},
+                        "_meta": {"source": source, "backgroundTask": {
+                            "taskId": "worker-task", "toolUseId": "worker-bg", "status": "completed"}}})
                 await self.client.session_update(session_id, update_agent_message_text("Unassigned background message"))
                 await self.client.session_update(session_id, {"sessionUpdate": "plan", "entries": [
                     {"content": "Background work", "priority": "medium", "status": "completed"}]})

@@ -26,7 +26,7 @@ Execute an empty cell:
 ```
 
 Now write `Explain @` in that cell and press Tab. Choose a project file. Expect a
-plain `./relative/path` with no leading `@`. Submit the completed prompt through
+path with the leading `@` preserved. Submit the completed prompt through
 your normal follow-up action.
 
 When the prompt finishes, the client automatically displays the final assistant
@@ -38,6 +38,17 @@ Ctrl-O on a message cell opens the usual Vim representation.
 Try another prompt. It should reuse the same client, and previews should not pile
 up into a stack of old replies. A prompt without an assistant message simply
 returns to its turn row.
+
+If Qwen supplies a suggested follow-up after completion, press `q` to return to
+turns. The suggestion must not add an Unassigned session activity row. Enter the
+prompt's turn to find the `Suggested follow-up` event; the reply stays unchanged.
+
+Submit `/model` through the notebook follow-up flow. Expect a VisiData picker of
+the agent's advertised models, with `*` on the current model. Select another row
+and press Enter: the picker closes with a model status message. The next actual
+prompt records the selected model. `/model` itself must not create a turn.
+Pressing `q` instead cancels selection. Long-form `/model ID ...` commands still
+go to the agent, preserving its special flags and one-off prompt syntax.
 
 ## 2. Questions
 
@@ -89,6 +100,15 @@ Qwen may execute shell commands internally. Those are visible as its reported to
 calls, but cannot be monitored through the client terminal service unless Qwen
 actually uses that service.
 
+The locally tested Qwen Code 0.25.0 build accepted a four-second foreground shell
+loop with terminal capability advertised, but emitted only pending, in-progress,
+and completed shell tool events. Output appeared in the completed event; there
+were no `terminal/create` calls or intermediate output frames. For this build,
+inspect the shell tool's event in its turn; `t` remains empty. Its vendor
+`qwen/status/session/tasks` endpoint is available for background task metadata,
+including output-file paths. Monitoring those tasks would require a separate
+Qwen adapter and is not implemented by the client terminal service.
+
 ## 5. Background events
 
 If your Qwen build supports background work, ask it to launch a worker, return an
@@ -129,3 +149,17 @@ and published-SDK wire exchanges. With Neovim and a sibling `jusi` checkout (or
 `JUSI_NVIM_ROOT`), they also exercise the actual notebook follow-up lane, native
 path completion popup, form cell edit, automatic reply preview, plan view, terminal
 monitor, and background question handling.
+
+Attention checks require Jusi core 1.0.5 or later and the matching Neovim plugin.
+An approval or question should add a badge without changing editor focus. Close
+its view with `q`: the badge must remain. Reopen with `a`, then answer or cancel:
+the badge must clear. Multi-step questions retain one attention ID.
+
+Background completion notices come from a tracked tool still running when its
+originating turn ends, or Qwen/GigaCode's explicit background-task completion
+metadata. Two messages (`background_task_completed` and
+`background_notification`) for the same task must produce one notice; a matching
+tool completion must not add another. A normal response, foreground tool, or
+session history replay must stay silent. During a background
+question, `:JusiAttention!` must dismiss completion notices while preserving the
+unanswered request. The real notebook fixture exercises these transitions.

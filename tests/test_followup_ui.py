@@ -63,5 +63,9 @@ def test_session_features_through_real_notebook_and_terminal(tmp_path):
     (tmp_path / "sample.py").write_text("print('sample')\n")
     result, events = _run_notebook_fixture(tmp_path, "session_features.lua")
     assert result["completion_followup"]
-    assert result["form"] and result["terminal"] and result["plan"] and result["url"]
+    assert result["form"] and result["terminal"] and result["plan"] and result["url"] and result["model"]
+    assert result["attention"]
+    assert result["metadata_attention"]
+    assert not any(row["type"] == "user_prompt" and row["text"].strip() == "/model" for row in events)
+    assert next(row for row in events if row["type"] == "user_prompt" and row["text"].strip() == "terminal")["raw"]["model"] == "fixture-beta"
     assert not any(row["type"] == "user_prompt" and "sample" in row["text"] for row in events)

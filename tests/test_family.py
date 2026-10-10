@@ -38,6 +38,7 @@ def test_two_exact_providers_make_compatible_catalog_claims() -> None:
     }
     assert validate_catalog_claims(catalog) == catalog
     assert family_claim()["capabilities"] == list(CAPABILITIES)
+    assert "attention" in family_claim()["capabilities"]
 
 
 def test_family_rejects_incompatible_shared_claims_but_allows_provider_presentation() -> None:

@@ -55,9 +55,37 @@ To browse sessions without putting an ID in the magic header, start a cell with:
 
 Enter on a session loads its history into the turns sheet. Later Jusi follow-ups
 continue that selected session.
+Press `q` from the turns sheet to return to the sessions list and select another session.
 While loading, follow-ups and further selections are rejected with a wait message.
 A failed load preserves the previous session and its displayed history.
 The agent must advertise `session/list` and either `session/load` or `session/resume`.
+
+## Attention
+
+Approvals and questions publish persistent Jusi attention. Answering, declining,
+cancelling, or withdrawing the request clears it. Pressing `q` only closes its
+view; `a` reopens the active request. Multi-step questions update the same badge.
+
+Background completion notices require a live tool reported as `in_progress` when
+its original turn ends, followed by a `completed` or `failed` update for that
+same tool ID. Qwen/GigaCode's explicit `background_task_completed` and
+`background_notification` message metadata also trigger notices for completed
+or failed tasks, even if the launching tool already finished. Notices are
+deduplicated by task ID and, when supplied, the originating tool ID across both
+event types. Each qualifying job produces one notice, including when a newer
+turn is running. Ordinary messages, normal turn completion, foreground tools,
+and replayed history produce no notices. Message text alone cannot trigger a
+completion notice.
+
+Use `:JusiAttention` to visit pending clients and `:JusiAttention!` to dismiss
+completion notices. Notifications do not move editor focus. Summaries omit
+prompt and tool content. Delivery failures are recorded in ACP diagnostics and
+do not block the agent or answers; uncertain creation is not retried.
+
+This requires Jusi core 1.0.5 or later and the matching Neovim plugin. Exact
+providers using `family_claim()` inherit the `attention` capability.
+Providers with copied catalog claims must add it too; Jusi rejects conflicting
+capability lists for the same family.
 
 ## Exact provider integration
 
@@ -123,11 +151,13 @@ globally.
   a Git dependency.
 - Agent-driven authentication is available through `/auth METHOD_ID` or an
   exact provider's configured `AgentLaunch.auth_method`.
-- `/sessions`, `/mode ID`, `/config ID VALUE`, and `/cancel` are family commands.
+- `/sessions`, `/model`, `/mode ID`, `/config ID VALUE`, and `/cancel` are family commands.
+- `/model` opens an advertised-model picker. Enter switches the session model
+  through ACP and closes the picker; `q` cancels. No conversation turn is added.
 - Initial bodies and later follow-ups use the same family-command dispatcher.
 - ACP `available_commands_update` entries appear in completion and in the event
   sheet with their descriptions and optional free-text input hints. Invoking an
-  advertised slash command sends its complete text as a regular ACP prompt;
+  advertised slash command other than a family command sends its complete text as a regular ACP prompt;
   command-specific behavior and output remain agent-owned.
 - Press `d` on a tool event to open its ACP-provided diff. Press `d` on a turn
   to browse all files changed during that turn, then Enter to open one through
@@ -233,7 +263,10 @@ overrides take precedence.
 
 Qwen's `qwen/notify/session/prompt-suggestion` notification is accepted as an
 advisory `Suggested follow-up` journal event. It never submits a prompt or edits
-the notebook, and does not replace the completed turn's reply.
+the notebook, and does not replace the completed turn's reply. Suggestions stay
+inside the originating turn's event sheet, including when received after the
+turn ends. Qwen's session prompt counter routes a delayed suggestion even while
+a later prompt runs; agents omitting that ID use the current or latest turn.
 
 To collect the last ten saved ACP diagnostics on the target machine, run
 `python -m jusi_acp.diagnostics` using the same Python environment as Jusi.
@@ -305,10 +338,11 @@ active prompt. There are no additional Vim answer buffers.
 ## Project path completion
 
 In a live ACP cell, type `@` and invoke normal Jusi completion (Tab). For example,
-`Explain @application` offers matching paths across the configured project.
-`@src/` narrows to that directory. Selecting a candidate inserts a plain relative
-path such as `./src/jusi_acp/application.py`: **the `@` is removed and no file is
-attached or read into the prompt**. Paths beginning `./` or `../` continue to
+`Explain @` offers files and directories at the project root. `@src/` offers only
+the immediate children of that directory; select a directory to continue browsing
+one level at a time. Selecting a candidate preserves the `@`, for example
+`@src/jusi_acp/application.py`. No file is attached or read into the prompt by
+completion. Paths beginning `./` or `../` continue to
 complete, and spaces are backslash-escaped. Other prompt text, including text
 after the cursor, is preserved. Completion also works while answering questions.
 

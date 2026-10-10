@@ -166,6 +166,26 @@ def make_turns_sheet(runtime: Any) -> Any:
     return session_commands(sheet)
 
 
+def make_models_sheet(runtime: Any, rows: list[dict[str, Any]]) -> Any:
+    from visidata import ItemColumn, Sheet
+
+    class ACPModelsSheet(Sheet):
+        rowtype = "ACP model"
+
+        def openRow(self, row: dict[str, Any], rowidx: int | None = None) -> None:
+            runtime.select_model(str(row["model_id"]), self)
+
+    sheet = ACPModelsSheet(
+        f"acp_models:{runtime.alias}", rows=rows,
+        columns=[ItemColumn("current", width=8), ItemColumn("name", width=35),
+                 ItemColumn("model_id", width=45), ItemColumn("description", width=70)],
+    )
+    sheet.runtime = runtime
+    sheet.session_id = runtime.session_id
+    sheet.cursorRowIndex = next((i for i, row in enumerate(rows) if row["current"]), 0)
+    return session_commands(sheet)
+
+
 def make_sessions_sheet(runtime: Any, rows: list[dict[str, Any]]) -> Any:
     from visidata import ItemColumn, Sheet
 

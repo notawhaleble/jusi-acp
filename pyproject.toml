@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
   "agent-client-protocol>=0.12.1,<0.13",
-  "jusi[vd]>=1.0.2,<2",
+  "jusi[vd]>=1.0.5,<2",
   "jsonschema>=4,<5",
 ]
 

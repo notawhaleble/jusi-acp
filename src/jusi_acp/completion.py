@@ -26,14 +26,20 @@ class PathCompleter:
         typed = token[1:] if token.startswith('@') else token
         typed = re.sub(r'\\(.)', r'\1', typed)
         normalized = typed.removeprefix('./').casefold()
+        directory, _, name = normalized.rpartition('/')
         paths = self._paths()
-        candidates = [p for p in paths if not (p.endswith('/') and p.casefold() == normalized) and (normalized in p.casefold() if '/' not in normalized
-                                           else p.casefold().startswith(normalized))]
+        candidates = []
+        for path in paths:
+            parent, _, basename = path.rstrip('/').casefold().rpartition('/')
+            if parent == directory and name in basename:
+                candidates.append(path)
         candidates.sort(key=lambda p: (not p.casefold().startswith(normalized), p.casefold()))
         items = []
         for path in candidates[:100]:
-            # Explicit relative paths also support continued directory completion.
-            text = path if path.startswith('../') else './' + path
+            if token.startswith('@'):
+                text = '@' + ('./' if typed.startswith('./') else '') + path
+            else:
+                text = path if path.startswith('../') else './' + path
             text = text.replace('\\', '\\\\').replace(' ', '\\ ')
             items.append({'text': text, 'label': path, 'detail': 'Project directory' if path.endswith('/') else 'Project file path',
                           'kind': 'text', 'start': match.start('token'), 'end': cursor})

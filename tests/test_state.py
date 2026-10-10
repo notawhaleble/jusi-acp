@@ -248,3 +248,22 @@ def test_final_usage_overrides_chunk_metadata_snapshot(tmp_path):
     store.add({"kind": "turn_stopped", "stopReason": "end_turn", "usage": {
         "inputTokens": 10, "outputTokens": 3, "totalTokens": 13}})
     assert store.turns_snapshot()[0]["total_tokens"] == 13
+
+
+def test_delayed_suggestion_belongs_to_original_turn_and_replays(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    store = EventStore("fixture", tmp_path)
+    store.bind_session("suggestion-session", load_cache=False)
+    store.add({"kind": "user_prompt", "text": "first"})
+    store.add({"kind": "turn_stopped", "stopReason": "end_turn"})
+    store.add({"kind": "user_prompt", "text": "second"})
+    store.add({"kind": "prompt_suggestion", "text": "Add tests", "notification": {
+        "sessionId": "suggestion-session", "promptId": "suggestion-session########1"}})
+    assert len(store.timeline_snapshot()) == 2
+    assert store.turn_events_snapshot(1)[-1]["text"] == "Add tests"
+    assert store.active_turn["turn"] == 2
+    assert store.turns_snapshot()[0]["reply"] == ""
+    cached = EventStore("fixture", tmp_path)
+    cached.bind_session("suggestion-session", load_cache=True)
+    assert cached.turn_events_snapshot(1)[-1]["text"] == "Add tests"
+    assert len(cached.timeline_snapshot()) == 2

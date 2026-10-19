@@ -13,7 +13,7 @@ from .config import AliasConfigurationError, resolve_alias
 
 FAMILY_ID = "acp"
 MAGIC_NAME = "acp"
-CAPABILITIES = ("execute", "followup", "complete", "interrupt", "editor_actions", "attention")
+CAPABILITIES = ("execute", "bootstrap", "followup", "complete", "interrupt", "editor_actions", "attention")
 PRESENTATION = {"syntax": "markdown", "indent": "markdown"}
 HANDOFF_MIME = "application/vnd.jusi.handoff.v1+json"
 
@@ -100,6 +100,7 @@ class _KernelRegistry:
             }
             display({HANDOFF_MIME: handoff}, raw=True)
 
+        acp_magic.__jusi_bootstrap_v1__ = lambda line: acp_magic(line, "")  # type: ignore[attr-defined]
         acp_magic.__jusi_acp_dispatcher_v1__ = True  # type: ignore[attr-defined]
         if existing is None:
             ipython.register_magic_function(acp_magic, magic_kind="cell", magic_name=MAGIC_NAME)

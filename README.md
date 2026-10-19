@@ -353,7 +353,10 @@ Results are bounded and cached briefly so completion does not scan on every key.
 
 Jusi currently requires a live client before completing a plugin cell. To complete
 your first prompt, execute an empty `%%acp ALIAS` cell first, then write the prompt
-as a follow-up. No agent prompt is sent by that empty initialization.
+as a follow-up. If you already have a draft, use `:JusiBootstrap`: it preserves
+the draft and initializes the session without submitting it. This requires Jusi
+with the bootstrap capability (ADR 0051). No agent prompt is sent by initialization;
+agent-advertised slash commands may arrive asynchronously.
 
 See [the manual testing guide](docs/manual-testing.md) for prompts and expected
 behavior, including features that depend on what the agent actually reports.

@@ -27,7 +27,8 @@ def _run_notebook_fixture(tmp_path, script_name):
         '[acp.fixture]\nprovider = "acp_fixture"\npath = ' + json.dumps(str(tmp_path)) + '\n')
     result_path = tmp_path / "result.json"
     env = dict(os.environ, HOME=str(home),
-               PYTHONPATH=os.pathsep.join(map(str, [root / "src", fixture_root, plugins])),
+               PYTHONPATH=os.pathsep.join([*map(str, [root / "src", fixture_root, plugins]),
+                                          *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep))]),
                JUSI_STATE_HOME=str(tmp_path / "state"), JUSI_NVIM_ROOT=str(frontend),
                JUSI_TEST_PYTHON=sys.executable, JUSI_TEST_RESULT=str(result_path),
                TERM="xterm-256color")
@@ -69,3 +70,10 @@ def test_session_features_through_real_notebook_and_terminal(tmp_path):
     assert not any(row["type"] == "user_prompt" and row["text"].strip() == "/model" for row in events)
     assert next(row for row in events if row["type"] == "user_prompt" and row["text"].strip() == "terminal")["raw"]["model"] == "fixture-beta"
     assert not any(row["type"] == "user_prompt" and "sample" in row["text"] for row in events)
+
+
+def test_bootstrap_completes_before_first_agent_prompt(tmp_path):
+    (tmp_path / "sample.py").write_text("print('sample')\n")
+    result, events = _run_notebook_fixture(tmp_path, "bootstrap.lua")
+    assert result["bootstrap"]
+    assert not any(row["type"] == "user_prompt" for row in events)

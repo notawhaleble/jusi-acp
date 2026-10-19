@@ -116,6 +116,13 @@ def test_two_kernel_adapters_register_one_dispatcher_and_route_exact_provider(tm
     assert handoff["payload"]["session_action"] == "resume"
     assert handoff["payload"]["session_id"] == "session-7"
 
+    assert "bootstrap" in family_claim()["capabilities"]
+    for alias, provider in [("one", "gigacode"), ("two", "fixture")]:
+        registered["acp"].__jusi_bootstrap_v1__(alias)
+        initialized = displayed[-1][HANDOFF_MIME]
+        assert initialized["plugin_id"] == provider
+        assert initialized["payload"]["body"] == ""
+
 
 def test_dispatcher_rejects_an_unavailable_configured_provider(tmp_path: Path) -> None:
     _reset_registry_for_tests()

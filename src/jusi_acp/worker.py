@@ -33,6 +33,8 @@ class ACPWorker:
             )
         if operation not in {"followup", "complete"}:
             raise OperationRejected(f"Unsupported ACP operation: {operation}", reason="unsupported")
+        if operation == "followup" and payload.get("attachments"):
+            payload = {**payload, "image_paths": [file["path"] for file in payload["attachments"]]}
         response = self._required_bridge().request(operation, payload)
         if response.get("ok") is True:
             result = response.get("result", {})
@@ -77,6 +79,9 @@ class ACPWorker:
             },
         }
         try:
+            if payload.get("attachments"):
+                from jusi.plugin_api import retain_input_images
+                application_payload["submission"]["image_paths"] = retain_input_images(payload, self.runtime_directory)
             fd = os.open(payload_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(application_payload, stream, ensure_ascii=False)

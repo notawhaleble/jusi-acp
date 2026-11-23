@@ -799,3 +799,24 @@ def test_qwen_model_notification_routes_and_updates_picker_without_turn(tmp_path
         with pytest.raises(Exception):
             await router(method, {"v": 2}, True)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_image_prompt_capability_and_bytes(tmp_path, monkeypatch, supported):
+    monkeypatch.setenv("JUSI_STATE_HOME", str(tmp_path / "state"))
+    payload = _payload(tmp_path)
+    payload["launch"]["environment"]["TEST_ACP_IMAGES"] = str(int(supported))
+    app = ACPApplication(payload)
+    image = tmp_path / "example.png"
+    image.write_bytes(b"image-fixture")
+    app.start()
+    try:
+        assert app._connected.wait(10)
+        if supported:
+            app.handle_operation("followup", {"body": "", "image_paths": [str(image)]})
+            assert any(row["text"] == "echo:image/png:aW1hZ2UtZml4dHVyZQ==" for row in app.store.rows)
+        else:
+            with pytest.raises(ValueError, match="does not accept image"):
+                app.handle_operation("followup", {"body": "describe", "image_paths": [str(image)]})
+    finally:
+        app.close()

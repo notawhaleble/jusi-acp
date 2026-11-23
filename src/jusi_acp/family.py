@@ -13,7 +13,7 @@ from .config import AliasConfigurationError, resolve_alias
 
 FAMILY_ID = "acp"
 MAGIC_NAME = "acp"
-CAPABILITIES = ("execute", "bootstrap", "followup", "complete", "interrupt", "editor_actions", "attention")
+CAPABILITIES = ("execute", "bootstrap", "followup", "complete", "interrupt", "editor_actions", "attention", "input:image/png")
 PRESENTATION = {"syntax": "markdown", "indent": "markdown"}
 HANDOFF_MIME = "application/vnd.jusi.handoff.v1+json"
 

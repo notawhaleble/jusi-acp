@@ -82,7 +82,8 @@ completion notices. Notifications do not move editor focus. Summaries omit
 prompt and tool content. Delivery failures are recorded in ACP diagnostics and
 do not block the agent or answers; uncertain creation is not retried.
 
-This requires Jusi core 1.0.5 or later and the matching Neovim plugin. Exact
+Use Jusi core 1.0.8 or later and the matching Neovim plugin. Focusing a
+Markdown reply also dismisses background completion notices for that client. Exact
 providers using `family_claim()` inherit the `attention` capability.
 Providers with copied catalog claims must add it too; Jusi rejects conflicting
 capability lists for the same family.
@@ -204,6 +205,8 @@ counts paths for which the agent supplied ACP diff content. Enter opens the full
 event details. An empty changes view means the agent supplied no diffs; it does
 not prove that no files changed.
 
+Completed replies open in JusiMarkdown over the client pane when the viewer is available. Use the notebook/output focus toggle to visit the reply. Press `Ctrl-Q` in normal mode to dismiss it and return to the selected turn. Clients without the viewer use the wrapped VisiData reply sheet.
+
 Usage is presented by the ACP family whenever the agent reports it. The turns
 sheet shows `total_tokens`, `input_tokens`, `output_tokens`, `thought_tokens`,
 `cached_read_tokens`, and `cached_write_tokens` from the final prompt response,
@@ -291,7 +294,7 @@ this is presentation context, not proof of worker ownership. Raw updates remain
 available in the journal. No worker identity is inferred from message wording
 or arbitrary extension metadata.
 
-From the turns, events, or reply views:
+From the VisiData turns, events, or reply sheets:
 
 | Key | View |
 | --- | --- |
@@ -360,3 +363,9 @@ agent-advertised slash commands may arrive asynchronously.
 
 See [the manual testing guide](docs/manual-testing.md) for prompts and expected
 behavior, including features that depend on what the agent actually reports.
+
+ACP prompt submission accepts temporary PNG cell images with a coordinated Jusi
+frontend and backend supporting `input:image/png`. The agent must advertise
+`promptCapabilities.image`. Initial turns and follow-ups send ordered image
+blocks, including for an image-only prompt. Commands and answers to pending
+questions require text.

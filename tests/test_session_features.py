@@ -186,6 +186,7 @@ def test_path_completion_respects_gitignore_ranges_and_pending_answers(tmp_path)
 
 
 def test_reply_preview_returns_to_its_turn_and_does_not_accumulate(tmp_path, monkeypatch):
+    monkeypatch.delenv("JUSI_EDITOR_ACTION_SOCKET", raising=False)
     from visidata import vd
     from jusi_acp.ui import make_turns_sheet
     app = ACPApplication(_payload(tmp_path))

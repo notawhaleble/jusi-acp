@@ -77,3 +77,20 @@ def test_bootstrap_completes_before_first_agent_prompt(tmp_path):
     result, events = _run_notebook_fixture(tmp_path, "bootstrap.lua")
     assert result["bootstrap"]
     assert not any(row["type"] == "user_prompt" for row in events)
+
+
+def test_transient_image_initial_turn_followup_and_retirement(tmp_path):
+    _, events = _run_notebook_fixture(tmp_path, "image_input.lua")
+    replies = [row["text"] for row in events if row["type"] == "agent_message_chunk"]
+    assert replies == ["echo:image/png:iVBORw0KGgoA/w==", "echo:text-only followup", "echo:image/png:iVBORw0KGgoA/w=="]
+
+
+def test_completed_reply_in_real_markdown_overlay(tmp_path, monkeypatch):
+    siblings = Path(__file__).resolve().parents[2]
+    host = siblings / "jusi-neovim" / "runtime"
+    markdown = siblings / "jusi-markdown"
+    if not (host / "plugin/jusi_neovim.lua").is_file() or not (markdown / "node_modules").is_dir():
+        pytest.skip("Requires the Jusi Neovim host and a built JusiMarkdown checkout")
+    monkeypatch.setenv("JUSI_TEST_PRESENTATION_HOST", str(host))
+    monkeypatch.setenv("JUSI_TEST_MARKDOWN", str(markdown))
+    _run_notebook_fixture(tmp_path, "markdown_reply.lua")

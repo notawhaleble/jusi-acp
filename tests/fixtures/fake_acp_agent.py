@@ -52,6 +52,7 @@ class FakeAgent:
             protocol_version=min(protocol_version, PROTOCOL_VERSION),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
+                prompt_capabilities={"image": os.environ.get("TEST_ACP_IMAGES") == "1"},
                 session_capabilities=SessionCapabilities(
                     list={}, resume={}, close={}, additional_directories={}
                 ),
@@ -98,7 +99,8 @@ class FakeAgent:
 
     async def prompt(self, session_id, prompt, **kwargs):  # type: ignore[no-untyped-def]
         _ = kwargs
-        text = prompt[0].text.strip()
+        first = prompt[0]
+        text = f"{first.mime_type}:{first.data}" if first.type == "image" else first.text.strip()
         if text == "elicitation-form":
             result = await self.client.create_elicitation("Configure the task", ElicitationFormSessionMode(
                 session_id=session_id, requested_schema={"type": "object", "properties": {

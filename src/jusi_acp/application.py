@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import Future as ConcurrentFuture
 import json
 import logging
@@ -28,12 +29,14 @@ from acp.schema import (
     Implementation,
     RequestPermissionResponse,
     TextContentBlock,
+    ImageContentBlock,
 )
 
 from . import __version__
 from .attention import AttentionPublisher, BackgroundTools
 from .compat import MODE_NOTIFICATIONS, MODEL_NOTIFICATION, PROMPT_SUGGESTION_NOTIFICATION, install_mode_notifications
 from .ipc import ApplicationController
+from .markdown import MarkdownReplies
 from .state import EventStore
 from .questions import QuestionRequest, question_text, form_questions, parse_form_answer
 from .completion import PathCompleter
@@ -77,6 +80,7 @@ class ACPApplication:
         self.auth_method = str(launch.get("auth_method", "")).strip()
         self.plugin_id = str(payload.get("plugin_id", ""))
         self.alias = str(submission.get("alias", "acp"))
+        self.initial_images = submission.get("image_paths", [])
         self.initial_body = str(submission.get("body", ""))
         self.session_action = str(submission.get("session_action", "new"))
         self.requested_session_id = str(submission.get("session_id", ""))
@@ -93,6 +97,7 @@ class ACPApplication:
         self.sheet: Any = None
         self.turns_sheet: Any = None
         self.live_sheet: Any = None
+        self.markdown_replies = MarkdownReplies()
         self.reply_sheet: Any = None
         self.plan_sheet: Any = None
         self.terminals_sheet: Any = None
@@ -441,7 +446,7 @@ class ACPApplication:
                     self.store.add_status("Authentication methods", "; ".join(auth_names))
                 if self.auth_method:
                     await self._authenticate(self.auth_method)
-                browse_sessions = _normalize_followup_body(self.initial_body).strip() == "/sessions"
+                browse_sessions = not self.initial_images and _normalize_followup_body(self.initial_body).strip() == "/sessions"
                 self._browse_sessions = browse_sessions
                 if browse_sessions:
                     try:
@@ -458,9 +463,9 @@ class ACPApplication:
                             "Authentication required", f"{exc}; use /auth METHOD_ID", "blocked"
                         )
                 self._connected.set()
-                if self.initial_body.strip() and not browse_sessions:
+                if (self.initial_body.strip() or self.initial_images) and not browse_sessions:
                     try:
-                        await self._prompt_or_command(self.initial_body, initial=True)
+                        await self._prompt_or_command(self.initial_body, initial=True, images=self.initial_images)
                     except InterruptedError:
                         self.store.add_status("Initial turn cancelled", status="cancelled")
                     except ValueError as exc:
@@ -633,6 +638,7 @@ class ACPApplication:
         future.add_done_callback(finished)
 
     def _show_selected_session(self) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd
         for sheet in list(vd.sheets):
             if (getattr(sheet, "runtime", None) is self
@@ -644,6 +650,7 @@ class ACPApplication:
         self._focus_turns_sheet()
 
     def _show_session_error(self, message: str) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd, TextSheet
         vd.push(TextSheet("Session selection failed", source=message.splitlines()))
 
@@ -686,7 +693,7 @@ class ACPApplication:
             if self._operation_cancel is None:
                 self._operation_cancel = threading.Event()
         try:
-            return self._submit(self._prompt_or_command(body))
+            return self._submit(self._prompt_or_command(body, images=payload.get("image_paths", ())))
         finally:
             with self._operation_lock:
                 self._operation_cancel = None
@@ -708,11 +715,20 @@ class ACPApplication:
         future: ConcurrentFuture[dict[str, Any]] = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
         return future.result()
 
-    async def _prompt_or_command(self, body: str, *, initial: bool = False) -> dict[str, Any]:
+    async def _prompt_or_command(self, body: str, *, initial: bool = False, images=()) -> dict[str, Any]:
         if self._model_change_pending:
             raise ValueError("Wait for model selection before submitting a follow-up")
         if self._session_loading:
             raise ValueError("A session is loading; wait before submitting a follow-up")
+        blocks = []
+        if images:
+            caps = getattr(self.initialize_response.agent_capabilities, "prompt_capabilities", None)
+            if not getattr(caps, "image", False):
+                raise ValueError("This ACP agent does not accept image prompts")
+            if body.lstrip().startswith("/") or self._answer_state is not None:
+                raise ValueError("Images require a prompt")
+            blocks = [ImageContentBlock(type="image", mimeType="image/png",
+                      data=base64.b64encode(Path(path).read_bytes()).decode("ascii")) for path in images]
         stripped = body.strip()
         with self._operation_lock:
             cancelled = self._operation_cancel is not None and self._operation_cancel.is_set()
@@ -790,7 +806,7 @@ class ACPApplication:
             return {"command": "auth", "method_id": parts[1]}
         if not initial:
             self._cancel_requested.clear()
-        self._turn_task = asyncio.create_task(self._prompt(body, initial=initial))
+        self._turn_task = asyncio.create_task(self._prompt(body, initial=initial, images=blocks))
         # A paused turn outlives its Jusi operation. Consume unattended task
         # exceptions; _prompt already records failures in the turn journal.
         self._turn_task.add_done_callback(self._turn_finished)
@@ -917,7 +933,7 @@ class ACPApplication:
             return dict(self._answer_state or {"status": "ready", "session_id": self.session_id})
         return await self._wait_for_turn()
 
-    async def _prompt(self, body: str, *, initial: bool) -> dict[str, Any]:
+    async def _prompt(self, body: str, *, initial: bool, images=()) -> dict[str, Any]:
         if not self.session_id:
             raise ValueError("ACP session is not ready; authenticate first if required")
         assert self._prompt_lock is not None
@@ -936,7 +952,7 @@ class ACPApplication:
             self._refresh(follow_tail=True)
             try:
                 response = await self.connection.prompt(
-                    self.session_id, [TextContentBlock(type="text", text=body)]
+                    self.session_id, ([TextContentBlock(type="text", text=body)] if body or not images else []) + list(images)
                 )
             except Exception as exc:
                 self.store.add({
@@ -1012,6 +1028,7 @@ class ACPApplication:
             loop.call_soon_threadsafe(shutdown.set)
         if self._thread is not None:
             self._thread.join(timeout=4)
+        self.markdown_replies.stop()
         self.attention.close()
 
     # UI and feedback ----------------------------------------------------
@@ -1030,6 +1047,7 @@ class ACPApplication:
             loop.call_soon_threadsafe(_resolve_future, future, None)
 
     def _push_sessions(self, rows: list[dict[str, Any]]) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd
         self.sessions_sheet = make_sessions_sheet(self, rows)
         vd.push(self.sessions_sheet)
@@ -1096,12 +1114,14 @@ class ACPApplication:
         future.add_done_callback(finished)
 
     def _push_models(self, rows: list[dict[str, Any]]) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd
         vd.push(make_models_sheet(self, rows))
 
     def _show_question(self, state: dict[str, Any]) -> None:
         if state is not self._answer_state or self._withdrawn_answer:
             return
+        self.markdown_replies.dismiss()
         from visidata import vd
         self._close_questions_sheet()
         request = self._questions.get(state["request_id"])
@@ -1133,6 +1153,7 @@ class ACPApplication:
     def _show_withdrawn_question(self) -> None:
         if not self._withdrawn_answer:
             return
+        self.markdown_replies.dismiss()
         from visidata import vd, TextSheet
         self._close_questions_sheet()
         self.questions_sheet = TextSheet("Question withdrawn", source=[
@@ -1167,6 +1188,7 @@ class ACPApplication:
         return deepcopy(self._pending_rows)
 
     def open_pending(self) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd
         if self.pending_sheet is None:
             self.pending_sheet = make_pending_sheet(self)
@@ -1174,6 +1196,7 @@ class ACPApplication:
         vd.push(self.pending_sheet)
 
     def open_plan(self) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd
         if self.plan_sheet is None:
             self.plan_sheet = make_plan_sheet(self)
@@ -1185,6 +1208,7 @@ class ACPApplication:
         vd.push(make_plan_sheet(self, self.store.plan_snapshot(int((row or {}).get("turn", 0)))))
 
     def open_terminals(self) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd
         if self.terminals_sheet is None:
             self.terminals_sheet = make_terminals_sheet(self)
@@ -1367,13 +1391,14 @@ class ACPApplication:
             self.reopen_question()
 
     def _dismiss_reply(self) -> None:
+        self.markdown_replies.dismiss()
         from visidata import vd
         if self.reply_sheet is not None and self.reply_sheet in vd.sheets:
             vd.remove(self.reply_sheet)
         self.reply_sheet = None
 
     def _show_completed_turn(self, turn_number: int) -> None:
-        from visidata import vd, TextSheet
+        from visidata import vd
         if self.store.active_turn is not None:
             return
         if self._answer_state is not None or self._withdrawn_answer:
@@ -1391,14 +1416,18 @@ class ACPApplication:
                 self.turns_sheet.cursorRowIndex = index
                 reply = row.get('reply', '')
                 if reply:
-                    self.reply_sheet = TextSheet(f'ACP turn {turn_number} reply', source=reply.splitlines())
-                    self.reply_sheet.options.wrap = True
-                    self.reply_sheet.runtime = self
-                    self.reply_sheet.addCommand('d', 'jusi-acp-reply-diffs',
-                        f'sheet.runtime.open_turn_diffs({{"turn": {turn_number}}})', 'show changes in this turn')
-                    from .ui import session_commands
-                    vd.push(session_commands(self.reply_sheet))
+                    self.markdown_replies.present(reply, lambda: self._show_reply_sheet(turn_number, reply))
                 break
+
+    def _show_reply_sheet(self, turn_number: int, reply: str) -> None:
+        from visidata import vd, TextSheet
+        from .ui import session_commands
+        self.reply_sheet = TextSheet(f'ACP turn {turn_number} reply', source=reply.splitlines())
+        self.reply_sheet.options.wrap = True
+        self.reply_sheet.runtime = self
+        self.reply_sheet.addCommand('d', 'jusi-acp-reply-diffs',
+            f'sheet.runtime.open_turn_diffs({{"turn": {turn_number}}})', 'show changes in this turn')
+        vd.push(session_commands(self.reply_sheet))
 
     def _focus_turns_sheet(self) -> None:
         if self.turns_sheet is None:

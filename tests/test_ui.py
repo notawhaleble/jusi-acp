@@ -107,3 +107,26 @@ vim.cmd("qa!")
     assert "Traceback (most recent call last)" not in screen["turn_screen"]
     assert not screen["error_seen"], screen["error_screen"]
     assert "Traceback (most recent call last)" not in screen["error_screen"]
+
+
+def test_rejected_markdown_cannot_cover_a_newer_view(monkeypatch):
+    from queue import Queue
+    from jusi_acp import markdown
+
+    ui_actions = Queue()
+    def reject(path, **options):
+        assert path.read_text(encoding="utf-8") == "## Reply\n\nα"
+        assert options["lifetime"] == "client"
+        raise markdown.EditorDeliveryError("No compatible provider")
+
+    monkeypatch.setenv("JUSI_EDITOR_ACTION_SOCKET", "fixture")
+    monkeypatch.setattr(markdown, "open_document", reject)
+    monkeypatch.setattr(markdown, "queue_action", ui_actions.put)
+    replies = markdown.MarkdownReplies()
+    try:
+        replies.present("## Reply\n\nα", lambda: pytest.fail("stale reply sheet opened"))
+        fallback = ui_actions.get(timeout=3)
+        replies.dismiss()
+        fallback()
+    finally:
+        replies.stop()

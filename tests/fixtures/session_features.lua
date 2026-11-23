@@ -92,7 +92,7 @@ local ok, failure = xpcall(function()
     return #items == 1 and items[1].attention_id == form_attention_id and items[1].message == "Answer required (2/2)"
   end, "form progress did not update existing attention")
   followup({"  Long answer", "α"})
-  wait_for(function() return screen():find("FORM:", 1, true) end, "no form reply")
+  wait_for(function() return screen():match("ACP turn %d+ reply") and screen():find("FORM:", 1, true) end, "no form reply")
   wait_for(function() return #attention() == 0 end, "answered form left attention pending")
   result.form = true
   local row = edit_body({"@samSUFFIX"})

@@ -29,17 +29,19 @@ Now write `Explain @` in that cell and press Tab. Choose a project file. Expect 
 path with the leading `@` preserved. Submit the completed prompt through
 your normal follow-up action.
 
-When the prompt finishes, the client automatically displays the final assistant
-message in a wrapped text sheet. Focus stays in Vim's notebook. You can immediately
-write another follow-up. Alternatively focus the client and press `q`: the turns
-sheet appears with this prompt's row selected. Enter drills into its events;
-Ctrl-O on a message cell opens the usual Vim representation.
+When the prompt finishes, the final assistant message appears over the client
+pane in JusiMarkdown. Focus stays in the notebook so you can write a follow-up.
+Use the notebook/output focus toggle to visit the reply, then press `Ctrl-Q` in
+normal mode. The same pane should show the turns sheet with this prompt's row
+selected. Without a Markdown viewer, the client shows a wrapped reply sheet
+that you dismiss with `q`. Enter on a turn opens its events. Ctrl-O on a
+message cell opens the usual Vim representation.
 
 Try another prompt. It should reuse the same client, and previews should not pile
 up into a stack of old replies. A prompt without an assistant message simply
 returns to its turn row.
 
-If Qwen supplies a suggested follow-up after completion, press `q` to return to
+If Qwen supplies a suggested follow-up after completion, dismiss the reply to return to
 turns. The suggestion must not add an Unassigned session activity row. Enter the
 prompt's turn to find the `Suggested follow-up` event; the reply stays unchanged.
 
